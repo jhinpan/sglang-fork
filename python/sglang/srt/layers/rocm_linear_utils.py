@@ -16,6 +16,13 @@ def aiter_dsv3_router_gemm(
 ):
     M = hidden_states.shape[0]
     N = weight.shape[0]
+
+    # For very small M (decode), hipBLAS GEMV via F.linear is significantly
+    # faster than the Triton GEMM kernel (~11 us vs ~38 us for M=1).
+    # Precision is equivalent: both accumulate in float32 internally.
+    if M <= 4:
+        return torch.nn.functional.linear(hidden_states, weight, None)
+
     y = None
 
     if M <= 256:

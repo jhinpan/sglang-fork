@@ -208,6 +208,29 @@ class AiterAttnBackend(AttentionBackend):
                 fast_mode = False
                 intra_batch_mode = False
 
+            # persist mla_decode kernel requires num_head % 16 == 0
+            # fall back to non-persist for head counts not meeting this constraint
+            # (e.g. 64 heads with tp8 gives 8 heads per GPU)
+            if self.num_head % 16 != 0:
+                _use_mla_ps_kernel = False
+                fast_mode = False
+                intra_batch_mode = False
+
+            # Determine if head padding is needed for non-persistent MLA decode.
+            # The aiter ASM MLA decode kernels only support gqa ratios of
+            # 16, 32, 64, 128. For unsupported ratios (e.g. 8 heads from
+            # 64 attention heads / tp8), pad to the next supported ratio.
+            self._mla_pad_to_nhead = None
+            _SUPPORTED_MLA_DECODE_GQA = [16, 32, 64, 128]
+            if self.num_head not in _SUPPORTED_MLA_DECODE_GQA:
+                candidates = [g for g in _SUPPORTED_MLA_DECODE_GQA if g > self.num_head]
+                if candidates:
+                    self._mla_pad_to_nhead = min(candidates)
+                    logger.info(
+                        f"MLA decode: padding num_head={self.num_head} to "
+                        f"{self._mla_pad_to_nhead} for ASM kernel compatibility"
+                    )
+
             self.max_split_per_batch = 32 if _use_mla_ps_kernel else None
 
             if self.num_draft_tokens is None and _use_mla_ps_kernel:
@@ -1383,7 +1406,7 @@ class AiterAttnBackend(AttentionBackend):
                         intra_batch_mode=intra_batch_mode,
                     )
 
-                mla_decode_fwd(
+                self._mla_decode_fwd_padded(
                     q,
                     K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
                     o,
@@ -1451,7 +1474,7 @@ class AiterAttnBackend(AttentionBackend):
                         ),
                         dtype=self.input_dtype,
                     )
-                    mla_decode_fwd(
+                    self._mla_decode_fwd_padded(
                         q_pad.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
                         o,
@@ -1481,7 +1504,7 @@ class AiterAttnBackend(AttentionBackend):
                         dtype=self.input_dtype,
                     )
 
-                    mla_decode_fwd(
+                    self._mla_decode_fwd_padded(
                         q,
                         K_Buffer.view(-1, 1, 1, layer.qk_head_dim),
                         o,
@@ -1539,6 +1562,27 @@ class AiterAttnBackend(AttentionBackend):
 
             return o.view(-1, layer.tp_q_head_num * layer.head_dim)
 
+    def _mla_decode_fwd_padded(self, q, k_buffer, o, *args, **kwargs):
+        """Call mla_decode_fwd with head padding for unsupported GQA ratios.
+
+        The aiter ASM MLA decode kernels only support GQA ratios of 16, 32, 64, 128.
+        For models with fewer query heads per TP shard (e.g. 64 heads / tp8 = 8),
+        this method pads q and o to the next supported GQA ratio, runs the kernel,
+        and copies back the valid heads.
+        """
+        if self._mla_pad_to_nhead is not None:
+            nhead_orig = q.shape[-2]
+            pad_h = self._mla_pad_to_nhead - nhead_orig
+            q_padded = torch.nn.functional.pad(q, (0, 0, 0, pad_h))
+            o_padded = torch.empty(
+                *o.shape[:-2], self._mla_pad_to_nhead, o.shape[-1],
+                dtype=o.dtype, device=o.device,
+            )
+            mla_decode_fwd(q_padded, k_buffer, o_padded, *args, **kwargs)
+            o.copy_(o_padded[..., :nhead_orig, :])
+        else:
+            mla_decode_fwd(q, k_buffer, o, *args, **kwargs)
+
     def forward_decode(
         self,
         q: torch.Tensor,
@@ -1594,7 +1638,7 @@ class AiterAttnBackend(AttentionBackend):
                     intra_batch_mode=intra_batch_mode,
                 )
 
-            mla_decode_fwd(
+            self._mla_decode_fwd_padded(
                 q.view(-1, layer.tp_q_head_num, layer.qk_head_dim),
                 k_buffer.view(-1, 1, 1, layer.qk_head_dim),
                 o.view(-1, layer.tp_q_head_num, layer.v_head_dim),

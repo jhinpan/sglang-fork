@@ -113,6 +113,13 @@ class PyMscclppCommunicator:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        # Initialize fields used by runtime checks before any early return.
+        # When MSCCL++ is unavailable/unsupported, constructor may return early,
+        # but should_mscclpp_allreduce() can still be queried safely.
+        self._context = None
+        self.context_selection = None
+        self.msg_size_for_finetune = []
+        self.msg_size2best_config = {}
 
         if not ops.IS_MSCCLPP_AR_AVAILABLE:
             # disable because of missing mscclpp library

@@ -485,15 +485,36 @@ class VisionAiterAttention(nn.Module):
         seq_lens = cu_seqlens[1:] - cu_seqlens[:-1]
         max_seqlen = seq_lens.max().item()
 
-        return self.flash_attn_varlen_func(
-            q=q,
-            k=k,
-            v=v,
-            cu_seqlens_q=cu_seqlens,
-            cu_seqlens_k=cu_seqlens,
-            max_seqlen_q=max_seqlen,
-            max_seqlen_k=max_seqlen,
-        )
+        try:
+            return self.flash_attn_varlen_func(
+                q=q,
+                k=k,
+                v=v,
+                cu_seqlens_q=cu_seqlens,
+                cu_seqlens_k=cu_seqlens,
+                max_seqlen_q=max_seqlen,
+                max_seqlen_k=max_seqlen,
+            )
+        except RuntimeError as e:
+            # Some ROCm+aiter combinations fail varlen vision kernels at runtime.
+            # Fallback to triton flash-attn for stability instead of crashing scheduler.
+            if "invalid argument for fmha_fwd" not in str(e):
+                raise
+            print_info_once(
+                "Aiter vision varlen kernel failed; falling back to triton_attn for this call."
+            )
+            output = torch.empty_like(q)
+            context_attention_fwd(
+                q,
+                k,
+                v,
+                output,
+                cu_seqlens.to(q.device),
+                seq_lens.to(q.device),
+                max_seqlen,
+                is_causal=False,
+            )
+            return output
 
 
 class VisionAscendAttention(nn.Module):
