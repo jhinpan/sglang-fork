@@ -304,26 +304,25 @@ def topk_transform_512_pytorch_vectorized(
 
     # For short sequences, use sequential indices
     needs_sequential = seq_lens <= TOPK
-    if needs_sequential.any():
-        sequential_indices = (
-            torch.arange(TOPK, device=device, dtype=torch.int32)
-            .unsqueeze(0)
-            .expand(batch_size, -1)
-        )
-        sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
+    sequential_indices = (
+        torch.arange(TOPK, device=device, dtype=torch.int32)
+        .unsqueeze(0)
+        .expand(batch_size, -1)
+    )
+    sequential_valid = sequential_indices < seq_lens.unsqueeze(1)
 
-        raw_indices = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK),
-            torch.where(
-                sequential_valid,
-                sequential_indices,
-                torch.tensor(-1, device=device, dtype=torch.int32),
-            ),
-            raw_indices,
-        )
-        valid_topk = torch.where(
-            needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
-        )
+    raw_indices = torch.where(
+        needs_sequential.unsqueeze(1).expand(-1, TOPK),
+        torch.where(
+            sequential_valid,
+            sequential_indices,
+            torch.tensor(-1, device=device, dtype=torch.int32),
+        ),
+        raw_indices,
+    )
+    valid_topk = torch.where(
+        needs_sequential.unsqueeze(1).expand(-1, TOPK), sequential_valid, valid_topk
+    )
 
     # Transform to page indices
     page_idx = raw_indices >> page_bits
