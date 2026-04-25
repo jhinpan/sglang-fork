@@ -2,6 +2,7 @@ import os
 from typing import Any, Optional
 
 import torch
+import torch.nn.functional as F
 
 from sglang.srt.utils import is_hip
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
@@ -88,6 +89,29 @@ def _sparse_attn_decode_from_fp8_cache(
         )
         gathered_kv = torch.cat([gathered_kv, extra_gathered_kv], dim=2)
         invalid_mask = torch.cat([invalid_mask, extra_invalid_mask], dim=2)
+
+    if os.environ.get("SGLANG_DSV4_SDPA_FLASHMLA_TORCH") == "1":
+        assert s_q == 1
+        q_sdpa = q.float().permute(0, 2, 1, 3)
+        k_sdpa = gathered_kv[:, 0].float().unsqueeze(1).expand(-1, h_q, -1, -1)
+        v_sdpa = (
+            gathered_kv[:, 0, :, :d_v].float().unsqueeze(1).expand(-1, h_q, -1, -1)
+        )
+        attn_mask = ~invalid_mask[:, 0].unsqueeze(1).unsqueeze(2).expand(
+            -1, h_q, 1, -1
+        )
+        output = F.scaled_dot_product_attention(
+            q_sdpa,
+            k_sdpa,
+            v_sdpa,
+            attn_mask=attn_mask,
+            dropout_p=0.0,
+            is_causal=False,
+            scale=softmax_scale,
+        )
+        output = output.permute(0, 2, 1, 3)
+        lse = q.new_zeros((b, h_q, s_q), dtype=torch.float32)
+        return output.to(torch.bfloat16), lse
 
     gathered_kv = gathered_kv.view(b * s_q, -1, d_qk).float()
     gathered_kv[gathered_kv != gathered_kv] = 0.0
