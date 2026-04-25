@@ -15,15 +15,13 @@ def _dequantize_model1_selected_k(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Gather and dequantize only the sparse K entries selected for decode."""
     d_nope, d_rope, tile_size, num_tiles = 448, 64, 64, 7
-    bytes_per_token = d_nope + 2 * d_rope + num_tiles + 1
 
     quant_k_cache = quant_k_cache.view(FP8_DTYPE)
-    num_blocks, block_size, h_k, cache_stride = quant_k_cache.shape
+    num_blocks, block_size, h_k, _ = quant_k_cache.shape
     assert h_k == 1
-    assert cache_stride == bytes_per_token
 
-    flat_cache = quant_k_cache.reshape(num_blocks * block_size, bytes_per_token)
-    invalid_mask = (indices_in_kvcache < 0) | (indices_in_kvcache >= flat_cache.size(0))
+    max_index = num_blocks * block_size
+    invalid_mask = (indices_in_kvcache < 0) | (indices_in_kvcache >= max_index)
     if topk_length is not None:
         topk = indices_in_kvcache.size(-1)
         invalid_mask |= torch.arange(0, topk, device=indices_in_kvcache.device).view(
@@ -32,16 +30,24 @@ def _dequantize_model1_selected_k(
             indices_in_kvcache.shape[0], 1, 1
         )
 
-    fixed_indices = indices_in_kvcache.clamp(0, flat_cache.size(0) - 1)
-    gathered = flat_cache.index_select(0, fixed_indices.reshape(-1)).view(
-        *indices_in_kvcache.shape, bytes_per_token
+    fixed_indices = indices_in_kvcache.clamp(0, max_index - 1)
+    block_indices = fixed_indices // block_size
+    block_offsets = fixed_indices % block_size
+
+    quant_k_cache = quant_k_cache.reshape(num_blocks, -1)
+    nope_rope = quant_k_cache[:, : block_size * (d_nope + 2 * d_rope)].reshape(
+        num_blocks, block_size, d_nope + 2 * d_rope
+    )
+    scales = (
+        quant_k_cache[:, block_size * (d_nope + 2 * d_rope) :]
+        .reshape(num_blocks, block_size, 8)[:, :, :num_tiles]
+        .view(torch.float8_e8m0fnu)
     )
 
+    gathered = nope_rope[block_indices, block_offsets]
     nope = gathered[..., :d_nope]
     rope = gathered[..., d_nope : d_nope + 2 * d_rope].view(torch.bfloat16)
-    scales = gathered[..., d_nope + 2 * d_rope :].view(torch.float8_e8m0fnu)[
-        ..., :num_tiles
-    ]
+    gathered_scales = scales[block_indices, block_offsets]
 
     out = torch.empty(
         (*indices_in_kvcache.shape, d_nope + d_rope),
@@ -52,7 +58,7 @@ def _dequantize_model1_selected_k(
     for tile_idx in range(num_tiles):
         start = tile_idx * tile_size
         end = start + tile_size
-        out[..., start:end] = nope[..., start:end].to(torch.bfloat16) * scales[
+        out[..., start:end] = nope[..., start:end].to(torch.bfloat16) * gathered_scales[
             ..., tile_idx
         ].to(torch.bfloat16).unsqueeze(-1)
 
