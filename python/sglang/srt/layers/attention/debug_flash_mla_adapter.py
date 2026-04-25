@@ -22,7 +22,7 @@ def _dequantize_model1_selected_k(
     assert h_k == 1
     assert cache_stride == bytes_per_token
 
-    flat_cache = quant_k_cache.view(num_blocks * block_size, bytes_per_token)
+    flat_cache = quant_k_cache.reshape(num_blocks * block_size, bytes_per_token)
     invalid_mask = (indices_in_kvcache < 0) | (indices_in_kvcache >= flat_cache.size(0))
     if topk_length is not None:
         topk = indices_in_kvcache.size(-1)
