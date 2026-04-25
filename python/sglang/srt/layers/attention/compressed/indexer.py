@@ -316,7 +316,7 @@ def topk_transform_512_pytorch_vectorized(
         torch.where(
             sequential_valid,
             sequential_indices,
-            torch.tensor(-1, device=device, dtype=torch.int32),
+            torch.full_like(sequential_indices, -1),
         ),
         raw_indices,
     )
@@ -334,16 +334,12 @@ def topk_transform_512_pytorch_vectorized(
     page_indices = (physical_pages << page_bits) | offset_in_page
     page_indices = page_indices.to(torch.int32)
 
-    page_indices = torch.where(
-        valid_topk, page_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-    )
+    page_indices = page_indices.masked_fill(~valid_topk, -1)
 
     out_page_indices.copy_(page_indices)
 
     if out_raw_indices is not None:
-        raw_indices = torch.where(
-            valid_topk, raw_indices, torch.tensor(-1, device=device, dtype=torch.int32)
-        )
+        raw_indices = raw_indices.masked_fill(~valid_topk, -1)
         out_raw_indices.copy_(raw_indices)
 
 
