@@ -1,3 +1,4 @@
+import os
 from typing import Any, Optional
 
 import torch
@@ -5,6 +6,111 @@ import torch
 from sglang.srt.utils import is_hip
 from sglang.srt.layers.quantization.fp8_kernel import is_fp8_fnuz
 FP8_DTYPE = torch.float8_e4m3fnuz if is_fp8_fnuz() else torch.float8_e4m3fn
+
+
+def _dequantize_model1_selected_k(
+    quant_k_cache: torch.Tensor,
+    indices_in_kvcache: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Gather and dequantize only the sparse K entries selected for decode."""
+    d_nope, d_rope, tile_size, num_tiles = 448, 64, 64, 7
+    bytes_per_token = d_nope + 2 * d_rope + num_tiles + 1
+
+    quant_k_cache = quant_k_cache.view(FP8_DTYPE)
+    num_blocks, block_size, h_k, cache_stride = quant_k_cache.shape
+    assert h_k == 1
+    assert cache_stride == bytes_per_token
+
+    flat_cache = quant_k_cache.view(num_blocks * block_size, bytes_per_token)
+    invalid_mask = (indices_in_kvcache < 0) | (indices_in_kvcache >= flat_cache.size(0))
+    if topk_length is not None:
+        topk = indices_in_kvcache.size(-1)
+        invalid_mask |= torch.arange(0, topk, device=indices_in_kvcache.device).view(
+            1, 1, topk
+        ).broadcast_to(indices_in_kvcache.shape) >= topk_length.view(
+            indices_in_kvcache.shape[0], 1, 1
+        )
+
+    fixed_indices = indices_in_kvcache.clamp(0, flat_cache.size(0) - 1)
+    gathered = flat_cache.index_select(0, fixed_indices.reshape(-1)).view(
+        *indices_in_kvcache.shape, bytes_per_token
+    )
+
+    nope = gathered[..., :d_nope]
+    rope = gathered[..., d_nope : d_nope + 2 * d_rope].view(torch.bfloat16)
+    scales = gathered[..., d_nope + 2 * d_rope :].view(torch.float8_e8m0fnu)[
+        ..., :num_tiles
+    ]
+
+    out = torch.empty(
+        (*indices_in_kvcache.shape, d_nope + d_rope),
+        dtype=torch.bfloat16,
+        device=quant_k_cache.device,
+    )
+    out[..., d_nope:] = rope
+    for tile_idx in range(num_tiles):
+        start = tile_idx * tile_size
+        end = start + tile_size
+        out[..., start:end] = nope[..., start:end].to(torch.bfloat16) * scales[
+            ..., tile_idx
+        ].to(torch.bfloat16).unsqueeze(-1)
+
+    return out, invalid_mask
+
+
+def _sparse_attn_decode_from_fp8_cache(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    softmax_scale: float,
+    attn_sink: Optional[torch.Tensor],
+    extra_k_cache: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+    d_v: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    b, s_q, h_q, d_qk = q.shape
+    gathered_kv, invalid_mask = _dequantize_model1_selected_k(
+        k_cache, indices, topk_length
+    )
+    if extra_k_cache is not None:
+        assert extra_indices is not None
+        extra_gathered_kv, extra_invalid_mask = _dequantize_model1_selected_k(
+            extra_k_cache, extra_indices, extra_topk_length
+        )
+        gathered_kv = torch.cat([gathered_kv, extra_gathered_kv], dim=2)
+        invalid_mask = torch.cat([invalid_mask, extra_invalid_mask], dim=2)
+
+    gathered_kv = gathered_kv.view(b * s_q, -1, d_qk).float()
+    gathered_kv[gathered_kv != gathered_kv] = 0.0
+    q = q.float().view(b * s_q, h_q, d_qk)
+
+    attn_weight = q @ gathered_kv.transpose(-1, -2)
+    attn_weight *= softmax_scale
+    attn_weight[
+        invalid_mask.view(b * s_q, 1, -1).broadcast_to(
+            b * s_q, h_q, invalid_mask.size(-1)
+        )
+    ] = float("-inf")
+
+    lse = attn_weight.logsumexp(dim=-1)
+    attn_weight = torch.exp(attn_weight - lse.unsqueeze(-1))
+    output = attn_weight @ gathered_kv[..., :d_v]
+    output = output.view(b, s_q, h_q, d_v)
+    lse = lse.view(b, s_q, h_q)
+
+    if attn_sink is not None:
+        output *= (
+            1.0 / (1.0 + torch.exp(attn_sink.view(1, 1, h_q) - lse))
+        ).unsqueeze(-1)
+
+    lonely_q_mask = lse == float("-inf")
+    output[lonely_q_mask.unsqueeze(-1).broadcast_to(b, s_q, h_q, d_v)] = 0.0
+    lse[lonely_q_mask] = float("+inf")
+
+    return output.to(torch.bfloat16), lse.transpose(1, 2)
 
 
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
@@ -56,15 +162,6 @@ def flash_mla_with_kvcache_torch(
     extra_topk_length: Optional[torch.Tensor] = None,
 ):
 
-    from sglang.srt.flashmla_tests import quant as flashmla_quant
-    from sglang.srt.flashmla_tests.lib import (
-        ExtraTestParamForDecode,
-        KVScope,
-        TestcaseForDecode,
-        TestParam,
-    )
-    from sglang.srt.flashmla_tests.ref import ref_sparse_attn_decode
-
     assert block_table is None
     assert cache_seqlens is None
     assert is_fp8_kvcache
@@ -72,96 +169,19 @@ def flash_mla_with_kvcache_torch(
     b, s_q, h_q, d_qk = q.shape
     d_v = head_dim_v
 
-    fp8_layout = flashmla_quant.FP8KVCacheLayout.MODEL1_FP8Sparse
-
-    p = TestParam(
-        s_q=s_q,
-        s_kv="unused",
-        topk="unused",
-        h_q=h_q,
-        h_kv=1,
-        d_qk=d_qk,
-        d_v=d_v,
-        decode=ExtraTestParamForDecode(
-            b=b,
-            is_varlen="unused",
-            have_zero_seqlen_k="unused",
-            extra_s_k="unused",
-            extra_topk="unused",
-            extra_block_size="unused",
-            have_extra_topk_length="unused",
-        ),
-        # unused?
-        seed=-1,
-        check_correctness=True,
-        is_all_indices_invalid=False,
-        num_runs=10,
-        have_attn_sink=True,
-        have_topk_length=True,
-    )
-
-    blocked_k_quantized = k_cache
-    blocked_k = flashmla_quant.dequantize_k_cache(
-        blocked_k_quantized.view(FP8_DTYPE), fp8_layout
-    )
-    # blocked_k_requantized = flashmla_quant.quantize_k_cache(blocked_k, fp8_layout)
-    # assert torch.testing.assert_allclose(blocked_k_requantized.byte(), blocked_k_quantized.byte())
-    kv_scope = KVScope(
-        t="unused",
-        cache_seqlens="unused",
-        block_table="unused",
-        blocked_k=blocked_k,
-        blocked_k_quantized=blocked_k_quantized,
-        abs_indices="unused",
-        indices_in_kvcache=indices,
-        topk_length=topk_length,
-    )
-
-    extra_kv_scope = None
-    if extra_k_cache is not None:
-        extra_blocked_k_quantized = extra_k_cache
-        extra_blocked_k = flashmla_quant.dequantize_k_cache(
-            extra_blocked_k_quantized.view(FP8_DTYPE), fp8_layout
-        )
-        # extra_blocked_k_requantized = flashmla_quant.quantize_k_cache(extra_blocked_k, fp8_layout)
-        # assert torch.testing.assert_allclose(extra_blocked_k_requantized.byte(), extra_blocked_k_quantized.byte())
-        extra_kv_scope = KVScope(
-            t="unused",
-            cache_seqlens="unused",
-            block_table="unused",
-            blocked_k=extra_blocked_k,
-            blocked_k_quantized=extra_blocked_k_quantized,
-            abs_indices="unused",
-            indices_in_kvcache=extra_indices_in_kvcache,
-            topk_length=extra_topk_length,
-        )
-
-    t = TestcaseForDecode(
-        p="unused",
+    assert indices is not None
+    return _sparse_attn_decode_from_fp8_cache(
         q=q,
+        k_cache=k_cache,
+        indices=indices,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
         attn_sink=attn_sink,
-        sm_scale=softmax_scale,
-        kv_scope=kv_scope,
-        extra_kv_scope=extra_kv_scope,
+        extra_k_cache=extra_k_cache,
+        extra_indices=extra_indices_in_kvcache,
+        extra_topk_length=extra_topk_length,
+        d_v=d_v,
     )
-    # print(f"hi {p=} {t=}")
-    # print(
-    #     f"hi info "
-    #     f"{get_tensor_info(t.kv_scope.blocked_k)=} "
-    #     f"{get_tensor_info(t.kv_scope.blocked_k_quantized)=} "
-    #     f"{get_tensor_info(t.extra_kv_scope.blocked_k) if t.extra_kv_scope is not None else None=} "
-    #     f"{get_tensor_info(t.extra_kv_scope.blocked_k_quantized) if t.extra_kv_scope is not None else None=} "
-    # )
-
-    pack_ref = ref_sparse_attn_decode(p, t)
-
-    # tile_scheduler_metadata, _ = flash_mla.get_mla_metadata()
-    # pack_fast_via_tester = flashmla_lib.run_flash_mla_decode(
-    #     p, t, tile_scheduler_metadata, num_splits=None
-    # )
-
-    # return pack_ref, pack_fast_via_tester
-    return pack_ref
 
 
 def _assert_close(pack_ref, pack_fast):
