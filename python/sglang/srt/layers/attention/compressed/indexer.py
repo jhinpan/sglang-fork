@@ -62,6 +62,42 @@ def fp8_paged_mqa_logits_torch(
     assert page_table.shape[0] == batch_size
     assert clean_logits == False
 
+    if os.environ.get("SGLANG_DSV4_VECTOR_FP8_MQA") == "1":
+        device = q_fp8.device
+        q = q_fp8[:, 0].to(torch.float32)
+        max_num_pages = page_table.shape[1]
+        max_padded_seq_len = max_num_pages * block_size
+        pages = page_table[:, :max_num_pages]
+
+        kvcache_flat = kvcache_fp8.reshape(-1, block_size * (head_dim + 4))
+        gathered_kvcache = kvcache_flat[pages]
+        scale_offset = block_size * head_dim
+        kvcache_value = gathered_kvcache[..., :scale_offset].view(FP8_DTYPE)
+        kvcache_scale = gathered_kvcache[..., scale_offset:].view(torch.float32)
+        kvcache_value = kvcache_value.to(torch.float32).view(
+            batch_size, max_padded_seq_len, head_dim
+        )
+        kvcache_scale = kvcache_scale.reshape(batch_size, max_padded_seq_len)
+
+        score = torch.bmm(kvcache_value, q.transpose(1, 2))
+        score = F.relu(score)
+        score = score * weight.unsqueeze(1)
+        score = score.sum(dim=2) * kvcache_scale
+
+        logits = torch.full(
+            (batch_size, max_seq_len),
+            float("-inf"),
+            dtype=torch.float32,
+            device=device,
+        )
+        copy_len = min(max_padded_seq_len, max_seq_len)
+        positions = torch.arange(max_seq_len, device=device).unsqueeze(0)
+        valid_mask = positions < seq_lens.unsqueeze(1)
+        logits[:, :copy_len] = torch.where(
+            valid_mask[:, :copy_len], score[:, :copy_len], logits[:, :copy_len]
+        )
+        return logits
+
     logits = page_table.new_empty((batch_size, max_seq_len), dtype=torch.float32)
     for i in range(batch_size):
         q = q_fp8[i, 0]  # (num_heads, head_dim)
