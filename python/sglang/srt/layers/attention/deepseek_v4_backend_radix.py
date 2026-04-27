@@ -63,6 +63,7 @@ from sglang.srt.layers.attention.deepseek_v4_backend import _pad_last_dim
 from sglang.srt.layers.attention.nsa.utils import is_nsa_prefill_cp_round_robin_split
 from sglang.srt.layers.dp_attention import get_attention_tp_rank, get_attention_tp_size
 from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+    fused_store_flashmla_cache_triton,
     quant_to_nope_fp8_rope_bf16_pack_triton,
 )
 from sglang.srt.layers.attention.triton_ops.compressed_metadata import (
@@ -71,6 +72,7 @@ from sglang.srt.layers.attention.triton_ops.compressed_metadata import (
 from sglang.srt.mem_cache.deepseekv4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.speculative.spec_info import SpecInput
+from sglang.srt.utils import is_hip
 
 if TYPE_CHECKING:
     from flash_mla.flash_mla_interface import FlashMLASchedMeta
@@ -128,6 +130,9 @@ def _copy_metadata(
 
 
 def _create_flashmla_metadata():
+    if is_hip() or envs.SGLANG_HACK_FLASHMLA_BACKEND.get() != "kernel":
+        return None
+
     import flash_mla
 
     return flash_mla.get_mla_metadata()[0]
@@ -944,11 +949,27 @@ class DeepseekV4BackendRadix(AttentionBackend, C4IndexerBackend, CompressorBacke
     ) -> None:
         raw_loc = forward_batch.out_cache_loc
         if envs.SGLANG_OPT_USE_FUSED_STORE_CACHE.get():
-            self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
-                layer_id=layer_id,
-                raw_loc=raw_loc,
-                cache_k=swa_k,
-            )
+            if is_hip():
+                if envs.SGLANG_DSV4_TRITON_FUSED_SWA_STORE.get():
+                    fused_store_flashmla_cache_triton(
+                        swa_k,
+                        self.token_to_kv_pool.swa_kv_pool.kv_buffer[layer_id],
+                        self.token_to_kv_pool.translate_loc_from_full_to_swa(raw_loc),
+                        page_size=self.token_to_kv_pool.swa_kv_pool.page_size,
+                    )
+                else:
+                    swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
+                    self.token_to_kv_pool.set_swa_key_buffer_radix(
+                        layer_id=layer_id,
+                        raw_loc=raw_loc,
+                        cache_nope_fp8_rope_bf16_pack=swa_k_pack,
+                    )
+            else:
+                self.token_to_kv_pool.set_swa_key_buffer_radix_fused(
+                    layer_id=layer_id,
+                    raw_loc=raw_loc,
+                    cache_k=swa_k,
+                )
         else:
             swa_k_pack = quant_to_nope_fp8_rope_bf16_pack_triton(swa_k)
             self.token_to_kv_pool.set_swa_key_buffer_radix(

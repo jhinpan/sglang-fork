@@ -138,6 +138,161 @@ def quant_to_nope_fp8_rope_bf16_pack_triton(
     )
 
 
+@triton.jit
+def _quant_store_flashmla_cache_kernel(
+    k_bf16_ptr,
+    cache_fp8_ptr,
+    cache_bf16_ptr,
+    cache_u8_ptr,
+    loc_ptr,
+    stride_k_0,
+    page_size: tl.constexpr,
+    bytes_per_page: tl.constexpr,
+    num_tokens: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    tile_id = tl.program_id(1)
+    offs = tl.arange(0, BLOCK_D)
+
+    loc = tl.load(loc_ptr + token_id)
+    page = loc // page_size
+    offset = loc - page * page_size
+
+    if tile_id < 7:
+        in_offsets = token_id * stride_k_0 + tile_id * BLOCK_D + offs
+        x = tl.load(k_bf16_ptr + in_offsets).to(tl.float32)
+        scale_raw = tl.maximum(tl.max(tl.abs(x), axis=0), EPS) / FP8_MAX
+        scale_exp = tl.math.ceil(tl.log2(scale_raw)).to(tl.int32)
+        scale = tl.exp2(scale_exp.to(tl.float32))
+        x_fp8 = tl.clamp(x / scale, FP8_MIN, FP8_MAX).to(
+            cache_fp8_ptr.dtype.element_ty
+        )
+        out_offsets = (
+            page * bytes_per_page
+            + offset * (448 + 2 * 64)
+            + tile_id * BLOCK_D
+            + offs
+        )
+        tl.store(cache_fp8_ptr + out_offsets, x_fp8)
+        scale_offset = page * bytes_per_page + page_size * (448 + 2 * 64)
+        scale_offset += offset * 8 + tile_id
+        tl.store(cache_u8_ptr + scale_offset, (scale_exp + 127).to(tl.uint8))
+    else:
+        rope_offsets = tl.arange(0, 64)
+        in_offsets = token_id * stride_k_0 + 448 + rope_offsets
+        rope = tl.load(k_bf16_ptr + in_offsets)
+        out_offsets = (
+            page * (bytes_per_page // 2)
+            + offset * ((448 + 2 * 64) // 2)
+            + 448 // 2
+            + rope_offsets
+        )
+        tl.store(cache_bf16_ptr + out_offsets, rope)
+
+
+def fused_store_flashmla_cache_triton(
+    k_bf16: torch.Tensor,
+    cache: torch.Tensor,
+    loc: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Quantize and store SWA K cache in the FlashMLA MODEL1 layout."""
+    assert k_bf16.dtype == torch.bfloat16
+    assert k_bf16.shape[-1] == 512
+    assert page_size > 0
+    assert cache.dtype == torch.uint8
+    assert loc.dtype in (torch.int32, torch.int64)
+    assert k_bf16.is_cuda and cache.is_cuda and loc.is_cuda
+
+    k_bf16 = k_bf16.contiguous() if not k_bf16.is_contiguous() else k_bf16
+    loc = loc.contiguous() if not loc.is_contiguous() else loc
+    fp8_dtype_info = torch.finfo(fp8_dtype)
+    _quant_store_flashmla_cache_kernel[(k_bf16.shape[0], 8)](
+        k_bf16,
+        cache.view(fp8_dtype),
+        cache.view(torch.bfloat16),
+        cache.view(torch.uint8),
+        loc,
+        k_bf16.stride(0),
+        page_size,
+        cache.shape[1],
+        k_bf16.shape[0],
+        FP8_MIN=fp8_dtype_info.min,
+        FP8_MAX=fp8_dtype_info.max,
+        EPS=1e-8,
+        BLOCK_D=64,
+        num_warps=2,
+        num_stages=1,
+    )
+
+
+@triton.jit
+def _quant_store_indexer_cache_kernel(
+    k_bf16_ptr,
+    cache_fp8_ptr,
+    cache_fp32_ptr,
+    loc_ptr,
+    stride_k_0,
+    page_size: tl.constexpr,
+    bytes_per_page: tl.constexpr,
+    FP8_MIN: tl.constexpr,
+    FP8_MAX: tl.constexpr,
+    EPS: tl.constexpr,
+    BLOCK_D: tl.constexpr,
+):
+    token_id = tl.program_id(0)
+    offs = tl.arange(0, BLOCK_D)
+    loc = tl.load(loc_ptr + token_id)
+    page = loc // page_size
+    offset = loc - page * page_size
+
+    x = tl.load(k_bf16_ptr + token_id * stride_k_0 + offs).to(tl.float32)
+    scale = tl.maximum(tl.max(tl.abs(x), axis=0), EPS) / FP8_MAX
+    x_fp8 = tl.clamp(x / scale, FP8_MIN, FP8_MAX).to(cache_fp8_ptr.dtype.element_ty)
+
+    out_k_offsets = page * bytes_per_page + offset * BLOCK_D + offs
+    out_s_offset = (page * bytes_per_page + page_size * BLOCK_D) // 4 + offset
+    tl.store(cache_fp8_ptr + out_k_offsets, x_fp8)
+    tl.store(cache_fp32_ptr + out_s_offset, scale)
+
+
+def fused_store_indexer_cache_triton(
+    k_bf16: torch.Tensor,
+    cache: torch.Tensor,
+    loc: torch.Tensor,
+    page_size: int,
+) -> None:
+    """Quantize and store C4 indexer K cache."""
+    assert k_bf16.dtype == torch.bfloat16
+    assert k_bf16.shape[-1] == 128
+    assert cache.dtype == torch.uint8
+    assert loc.dtype in (torch.int32, torch.int64)
+    assert k_bf16.is_cuda and cache.is_cuda and loc.is_cuda
+
+    k_bf16 = k_bf16.contiguous() if not k_bf16.is_contiguous() else k_bf16
+    loc = loc.contiguous() if not loc.is_contiguous() else loc
+    fp8_dtype_info = torch.finfo(fp8_dtype)
+    _quant_store_indexer_cache_kernel[(k_bf16.shape[0],)](
+        k_bf16,
+        cache.view(fp8_dtype),
+        cache.view(torch.float32),
+        loc,
+        k_bf16.stride(0),
+        page_size,
+        cache.shape[1],
+        FP8_MIN=fp8_dtype_info.min,
+        FP8_MAX=fp8_dtype_info.max,
+        EPS=1e-4,
+        BLOCK_D=128,
+        num_warps=4,
+        num_stages=1,
+    )
+
+
 # Torch implementation for accuracy baseline
 def quant_to_nope_fp8_rope_bf16_pack(k_bf16: torch.Tensor) -> NopeFp8RopeBf16Pack:
     assert k_bf16.dtype == torch.bfloat16

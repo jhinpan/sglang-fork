@@ -143,6 +143,45 @@ def _sparse_attn_decode_from_fp8_cache(
     return output.to(torch.bfloat16), lse.transpose(1, 2)
 
 
+def _sparse_attn_decode_from_fp8_cache_triton_dequant(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    indices: torch.Tensor,
+    topk_length: Optional[torch.Tensor],
+    softmax_scale: float,
+    attn_sink: Optional[torch.Tensor],
+    extra_k_cache: Optional[torch.Tensor],
+    extra_indices: Optional[torch.Tensor],
+    extra_topk_length: Optional[torch.Tensor],
+    d_v: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    from sglang.srt.layers.attention.triton_ops.dsv4_flashmla_sparse_decode import (
+        dequantize_model1_selected_k_triton,
+        sparse_decode_gathered_triton,
+    )
+
+    b, s_q, h_q, d_qk = q.shape
+    gathered_kv, invalid_mask = dequantize_model1_selected_k_triton(
+        k_cache, indices, topk_length
+    )
+    if extra_k_cache is not None:
+        assert extra_indices is not None
+        extra_gathered_kv, extra_invalid_mask = dequantize_model1_selected_k_triton(
+            extra_k_cache, extra_indices, extra_topk_length
+        )
+        gathered_kv = torch.cat([gathered_kv, extra_gathered_kv], dim=2)
+        invalid_mask = torch.cat([invalid_mask, extra_invalid_mask], dim=2)
+
+    return sparse_decode_gathered_triton(
+        q=q,
+        gathered_kv=gathered_kv,
+        invalid_mask=invalid_mask,
+        softmax_scale=softmax_scale,
+        attn_sink=attn_sink,
+        d_v=d_v,
+    )
+
+
 def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
     if is_hip():
         # backend == "torch"
@@ -166,6 +205,9 @@ def flash_mla_with_kvcache_entrypoint(backend: str, **kwargs):
 
     if backend == "torch":
         return flash_mla_with_kvcache_torch(**kwargs)
+
+    if backend == "triton":
+        return flash_mla_with_kvcache_triton(**kwargs)
 
     if backend == "kernel":
         return flash_mla.flash_mla_with_kvcache(**kwargs)
@@ -201,6 +243,46 @@ def flash_mla_with_kvcache_torch(
 
     assert indices is not None
     return _sparse_attn_decode_from_fp8_cache(
+        q=q,
+        k_cache=k_cache,
+        indices=indices,
+        topk_length=topk_length,
+        softmax_scale=softmax_scale,
+        attn_sink=attn_sink,
+        extra_k_cache=extra_k_cache,
+        extra_indices=extra_indices_in_kvcache,
+        extra_topk_length=extra_topk_length,
+        d_v=d_v,
+    )
+
+
+def flash_mla_with_kvcache_triton(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    block_table: Optional[torch.Tensor],
+    cache_seqlens: Optional[torch.Tensor],
+    head_dim_v: int,
+    tile_scheduler_metadata: Any,
+    num_splits: None = None,
+    softmax_scale: Optional[float] = None,
+    causal: bool = False,
+    is_fp8_kvcache: bool = False,
+    indices: Optional[torch.Tensor] = None,
+    attn_sink: Optional[torch.Tensor] = None,
+    extra_k_cache: Optional[torch.Tensor] = None,
+    extra_indices_in_kvcache: Optional[torch.Tensor] = None,
+    topk_length: Optional[torch.Tensor] = None,
+    extra_topk_length: Optional[torch.Tensor] = None,
+):
+    assert block_table is None
+    assert cache_seqlens is None
+    assert is_fp8_kvcache
+
+    _ = tile_scheduler_metadata, num_splits, causal
+    d_v = head_dim_v
+
+    assert indices is not None
+    return _sparse_attn_decode_from_fp8_cache_triton_dequant(
         q=q,
         k_cache=k_cache,
         indices=indices,

@@ -163,6 +163,68 @@ def apply_rotary_emb_triton_kernel(
     tl.store(x_ptr + offs_x_imag, out_imag, mask=mask)
 
 
+@triton.jit
+def apply_rotary_emb_qk_triton_kernel(
+    q_ptr,
+    k_ptr,
+    freqs_ptr,
+    positions_ptr,
+    rope_dim,
+    q_num_heads: tl.constexpr,
+    q_stride_batch,
+    q_stride_head,
+    q_stride_dim,
+    k_stride_batch,
+    k_stride_head,
+    k_stride_dim,
+    stride_freq_pos,
+    stride_freq_dim,
+    USE_POS: tl.constexpr,
+    IS_INVERSE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+):
+    pid_batch = tl.program_id(0)
+    pid_head = tl.program_id(1)
+    pid_dim = tl.program_id(2)
+
+    if USE_POS:
+        position = tl.load(positions_ptr + pid_batch)
+    else:
+        position = pid_batch
+
+    is_q = pid_head < q_num_heads
+    head = tl.where(is_q, pid_head, pid_head - q_num_heads)
+    x_ptr = tl.where(is_q, q_ptr, k_ptr)
+    stride_batch = tl.where(is_q, q_stride_batch, k_stride_batch)
+    stride_head = tl.where(is_q, q_stride_head, k_stride_head)
+    stride_dim = tl.where(is_q, q_stride_dim, k_stride_dim)
+    base_offset = pid_batch * stride_batch + head * stride_head
+
+    offs_pair = pid_dim * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    mask = offs_pair < (rope_dim // 2)
+
+    offs_x_real = base_offset + offs_pair * 2 * stride_dim
+    offs_x_imag = base_offset + (offs_pair * 2 + 1) * stride_dim
+
+    x_real = tl.load(x_ptr + offs_x_real, mask=mask, other=0.0).to(tl.float32)
+    x_imag = tl.load(x_ptr + offs_x_imag, mask=mask, other=0.0).to(tl.float32)
+
+    offs_freq_real = position * stride_freq_pos + offs_pair * 2 * stride_freq_dim
+    offs_freq_imag = position * stride_freq_pos + (offs_pair * 2 + 1) * stride_freq_dim
+    freq_real = tl.load(freqs_ptr + offs_freq_real, mask=mask, other=0.0)
+    freq_imag = tl.load(freqs_ptr + offs_freq_imag, mask=mask, other=0.0)
+
+    if IS_INVERSE:
+        out_real = x_real * freq_real + x_imag * freq_imag
+        out_imag = x_imag * freq_real - x_real * freq_imag
+    else:
+        out_real = x_real * freq_real - x_imag * freq_imag
+        out_imag = x_real * freq_imag + x_imag * freq_real
+
+    tl.store(x_ptr + offs_x_real, out_real, mask=mask)
+    tl.store(x_ptr + offs_x_imag, out_imag, mask=mask)
+
+
 def apply_rotary_emb_triton(
     x: torch.Tensor,
     freqs_cis: torch.Tensor,
@@ -239,3 +301,50 @@ def apply_rotary_emb_triton(
         )
 
     return x
+
+
+def apply_rotary_emb_qk_triton(
+    q: torch.Tensor,
+    k: torch.Tensor,
+    freqs_cis: torch.Tensor,
+    positions: Optional[torch.Tensor] = None,
+    inverse: bool = False,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Apply RoPE to q and k in one Triton launch for the HIP decode path."""
+    assert q.ndim == 3 and k.ndim == 3
+    assert q.shape[0] == k.shape[0]
+    assert q.shape[-1] == k.shape[-1]
+
+    batch_size, q_num_heads, rope_dim = q.shape
+    k_num_heads = k.shape[1]
+    freqs_real = torch.view_as_real(freqs_cis).flatten(-2)
+
+    BLOCK_SIZE = 128
+    num_blocks_dim = triton.cdiv(rope_dim // 2, BLOCK_SIZE)
+    grid = (batch_size, q_num_heads + k_num_heads, num_blocks_dim)
+
+    if positions is not None:
+        assert positions.shape == (
+            batch_size,
+        ), f"positions shape {positions.shape} != ({batch_size},)"
+
+    apply_rotary_emb_qk_triton_kernel[grid](
+        q,
+        k,
+        freqs_real,
+        positions,
+        rope_dim,
+        q_num_heads,
+        q.stride(0),
+        q.stride(1),
+        q.stride(-1),
+        k.stride(0),
+        k.stride(1),
+        k.stride(-1),
+        freqs_real.stride(0),
+        freqs_real.stride(1),
+        USE_POS=positions is not None,
+        IS_INVERSE=inverse,
+        BLOCK_SIZE=BLOCK_SIZE,
+    )
+    return q, k

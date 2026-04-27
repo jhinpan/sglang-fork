@@ -12,6 +12,10 @@ from sglang.srt.constants import GPU_MEMORY_TYPE_KV_CACHE
 from sglang.srt.environ import envs
 from sglang.srt.layers.attention.nsa import index_buf_accessor, index_buf_accessor_v4
 from sglang.srt.layers.attention.nsa.index_buf_accessor_v4 import NopeFp8RopeBf16Pack
+from sglang.srt.layers.attention.nsa.quant_k_cache_v4 import (
+    fused_store_flashmla_cache_triton,
+    quant_to_nope_fp8_rope_bf16_pack_triton,
+)
 from sglang.srt.mem_cache.compress_state import (
     CompressStatePool,
     DeepSeekV4CompressState,
@@ -389,6 +393,17 @@ class DeepSeekV4IndexerPool(KVCache):
         loc: torch.Tensor,
         cache_k: torch.Tensor,
     ) -> None:
+        if cache_k.is_cuda and cache_k.device.type == "cuda" and torch.version.hip:
+            from sglang.srt.layers.attention.nsa.triton_kernel import act_quant
+
+            index_k, index_k_scale = act_quant(cache_k, block_size=128)
+            return self.set_index_k_scale_buffer(
+                layer_id,
+                loc,
+                index_k,
+                index_k_scale.squeeze(-1),
+            )
+
         return fused_store_cache(
             input=cache_k,
             cache=self.index_k_with_scale_buffer[layer_id - self.start_layer],
@@ -841,6 +856,16 @@ class DeepSeekV4TokenToKVPool(KVCache):
     ) -> None:
         _, compress_layer_id, compress_kv_pool = self.layer_mapping[layer_id]
         assert compress_kv_pool is not None
+        if cache_k.is_cuda and cache_k.device.type == "cuda" and torch.version.hip:
+            if envs.SGLANG_DSV4_TRITON_FUSED_EXTRA_STORE.get():
+                return fused_store_flashmla_cache_triton(
+                    cache_k.bfloat16(),
+                    compress_kv_pool.kv_buffer[compress_layer_id],
+                    loc,
+                    page_size=compress_kv_pool.page_size,
+                )
+            pack = quant_to_nope_fp8_rope_bf16_pack_triton(cache_k.bfloat16())
+            return compress_kv_pool.set_key_buffer(compress_layer_id, loc, pack)
         return compress_kv_pool.set_key_buffer_fused(compress_layer_id, loc, cache_k)
 
     def set_index_k_fused(

@@ -369,10 +369,18 @@ def fused_rope(
     from sglang.srt.utils import is_hip
 
     if is_hip():
-        from sglang.srt.layers.deepseek_v4_rope import apply_rotary_emb_triton
+        from sglang.srt.layers.deepseek_v4_rope import (
+            apply_rotary_emb_qk_triton,
+            apply_rotary_emb_triton,
+        )
 
-        apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
-        if k is not None:
+        if k is not None and q.ndim == 3 and k.ndim == 3:
+            apply_rotary_emb_qk_triton(
+                q, k, freqs_cis, positions=positions, inverse=inverse
+            )
+        else:
+            apply_rotary_emb_triton(q, freqs_cis, positions=positions, inverse=inverse)
+        if k is not None and not (q.ndim == 3 and k.ndim == 3):
             apply_rotary_emb_triton(k, freqs_cis, positions=positions, inverse=inverse)
         return
 
