@@ -383,6 +383,12 @@ run_client() {
     -v "${root}/aiperf-cache:/aiperf_mmap_cache" \
     "${IMAGE}" \
     bash /run_client.sh "${name}" "${PORT}" "${duration}" "${warmup}"
+  docker run --rm \
+    --label "spur_job_id=${SPUR_JOB_ID}" \
+    -v "${results}:/results" \
+    --entrypoint chmod \
+    "${IMAGE}" \
+    -R a+rX "/results/${name}"
   echo "DSV41_CLIENT_DONE name=${name} at=$(date -Is)"
 }
 
@@ -404,6 +410,7 @@ stop_server baseline-a2
 start_server candidate-b2 "${candidate_config}"
 run_client ab-b2-candidate "${AB_DURATION}" 1
 run_client canonical-candidate-3600 "${CANONICAL_DURATION}" 10
+date +%s.%N >"${root}/canonical_end_ts"
 curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
 test "$(docker inspect -f '{{.State.Running}}' "${server_name}")" = "true"
 stop_server candidate-b2
@@ -445,12 +452,23 @@ then
 else
   trace_status=failed
 fi
+docker run --rm \
+  --label "spur_job_id=${SPUR_JOB_ID}" \
+  -v "${root}/trace:/trace" \
+  --entrypoint chmod \
+  "${IMAGE}" \
+  -R a+rX /trace
 
 kill "${sampler_pid}"
 wait "${sampler_pid}" 2>/dev/null || true
 sampler_pid=""
 
-python3 - "${results}" "${root}/hbm.jsonl" "${root}" "${trace_status}" <<'PY'
+python3 - \
+  "${results}" \
+  "${root}/hbm.jsonl" \
+  "${root}" \
+  "${trace_status}" \
+  "${root}/canonical_end_ts" <<'PY'
 import json
 import math
 import re
@@ -462,6 +480,7 @@ results = Path(sys.argv[1])
 hbm_file = Path(sys.argv[2])
 root = Path(sys.argv[3])
 trace_status = sys.argv[4]
+canonical_end = float(Path(sys.argv[5]).read_text())
 
 names = (
     "ab-a1-baseline",
@@ -503,8 +522,10 @@ for line in hbm_file.read_text().splitlines():
         rows[item["card"]].append(item)
 hbm = {}
 for card, values in sorted(rows.items()):
-    end = values[-1]["ts"]
-    tail = [row for row in values if row["ts"] >= end - 600]
+    values = [row for row in values if row["ts"] <= canonical_end]
+    tail = [
+        row for row in values if row["ts"] >= canonical_end - 600
+    ]
     xs = [(row["ts"] - tail[0]["ts"]) / 60 for row in tail]
     ys = [row["used_bytes"] / 2**30 for row in tail]
     xbar = sum(xs) / len(xs)
@@ -545,9 +566,10 @@ for path in sorted(root.glob("server-*.log")):
                 "traceback_count": text.count(
                     "Traceback (most recent call last)"
                 ),
-                "error_count": len(
+                "http_500_count": text.count("500 Internal Server Error"),
+                "memory_error_count": len(
                     re.findall(
-                        r"\b(?:ERROR|memory fault|out of memory)\b",
+                        r"\b(?:memory fault|out of memory)\b",
                         text,
                         re.I,
                     )
@@ -556,7 +578,16 @@ for path in sorted(root.glob("server-*.log")):
             sort_keys=True,
         )
     )
-print("DSV41_TRACE_SUMMARY " + json.dumps({"status": trace_status}))
+trace_files = sorted(root.glob("trace/**/*kernel_stats.csv"))
+print(
+    "DSV41_TRACE_SUMMARY "
+    + json.dumps(
+        {
+            "status": trace_status,
+            "kernel_stats_files": len(trace_files),
+        }
+    )
+)
 PY
 
 echo "DSV41_CANONICAL_COMPLETE host=$(hostname) run=${run_id} at=$(date -Is)"
