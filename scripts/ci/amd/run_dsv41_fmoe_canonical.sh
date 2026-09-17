@@ -146,6 +146,18 @@ git clone --filter=blob:none https://github.com/SemiAnalysisAI/InferenceX.git "$
 git -C "${src}/InferenceX" checkout "${INFERENCEX_SHA}"
 git -C "${src}/InferenceX" submodule update --init --depth 1 utils/aiperf
 
+docker run --rm \
+  --label "spur_job_id=${SPUR_JOB_ID}" \
+  -v "${src}/aiter:/target" \
+  --entrypoint bash \
+  "${IMAGE}" \
+  -lc '
+    cp /sgl-workspace/aiter/aiter/ops/mha.py /target/aiter/ops/mha.py
+    cp -a /sgl-workspace/aiter/aiter/jit/*.so /target/aiter/jit/
+    printf "DSV41_AITER_MHA_SHA256 "
+    sha256sum /target/aiter/ops/mha.py
+  '
+
 cat >"${root}/hbm_sampler.py" <<'PY'
 import json
 import subprocess
