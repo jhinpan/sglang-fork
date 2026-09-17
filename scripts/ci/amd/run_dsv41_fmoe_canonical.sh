@@ -146,17 +146,22 @@ git clone --filter=blob:none https://github.com/SemiAnalysisAI/InferenceX.git "$
 git -C "${src}/InferenceX" checkout "${INFERENCEX_SHA}"
 git -C "${src}/InferenceX" submodule update --init --depth 1 utils/aiperf
 
-docker run --rm \
-  --label "spur_job_id=${SPUR_JOB_ID}" \
-  -v "${src}/aiter:/target" \
-  --entrypoint bash \
-  "${IMAGE}" \
-  -lc '
-    cp /sgl-workspace/aiter/aiter/ops/mha.py /target/aiter/ops/mha.py
-    cp -a /sgl-workspace/aiter/aiter/jit/*mha*.so /target/aiter/jit/
-    printf "DSV41_AITER_MHA_SHA256 "
-    sha256sum /target/aiter/ops/mha.py
-  '
+python3 - \
+  "${src}/aiter/aiter/configs/model_configs/dsv41_flash_fp8fp4_tuned_fmoe.csv" \
+  "${root}/candidate-runtime.csv" <<'PY'
+import csv
+import sys
+
+with open(sys.argv[1], newline="") as stream:
+    rows = list(csv.DictReader(stream))
+with open(sys.argv[2], "w", newline="") as stream:
+    writer = csv.DictWriter(stream, fieldnames=rows[0].keys())
+    writer.writeheader()
+    for row in rows:
+        row["topk"] = "5"
+        writer.writerow(row)
+PY
+echo "DSV41_SERVER_RUNTIME image-pinned topk5-compat"
 
 cat >"${root}/hbm_sampler.py" <<'PY'
 import json
@@ -247,8 +252,8 @@ run_agentic_replay_and_write_outputs "${RESULT_DIR}"
 SH
 chmod 700 "${root}/run_client.sh"
 
-baseline_config="/src/aiter/aiter/configs/tuned_fmoe.csv"
-candidate_config="/src/aiter/aiter/configs/tuned_fmoe.csv:/src/aiter/aiter/configs/model_configs/dsv41_flash_fp8fp4_tuned_fmoe.csv"
+baseline_config="/sgl-workspace/aiter/aiter/configs/tuned_fmoe.csv"
+candidate_config="/sgl-workspace/aiter/aiter/configs/tuned_fmoe.csv:/config/dsv41.csv"
 
 start_server() {
   arm="$1"
@@ -272,7 +277,6 @@ start_server() {
     -e AITER_FLYDSL_STAGE2_FP8=0 \
     -e ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
     -e AITER_ONLINE_TUNE=0 \
-    -e AITER_AOT_IMPORT=0 \
     -e AITER_BF16_FP8_MOE_BOUND=0 \
     -e TRITON_HIP_USE_ASYNC_COPY=0 \
     -e SGLANG_DSV41_REASONING_EFFORT=high \
@@ -283,10 +287,9 @@ start_server() {
     -e HF_HUB_OFFLINE=1 \
     -e HF_DATASETS_OFFLINE=1 \
     -e PYTHONUNBUFFERED=1 \
-    -e PYTHONPATH=/src/sglang/python:/src/aiter \
     -e "AITER_CONFIG_FMOE=${config}" \
     -v "${model}:/models/DeepSeek-V4.1-Flash:ro" \
-    -v "${src}:/src" \
+    -v "${root}/candidate-runtime.csv:/config/dsv41.csv:ro" \
     --entrypoint '' \
     "${IMAGE}" \
     python3 -m sglang.launch_server \
