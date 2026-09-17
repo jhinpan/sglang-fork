@@ -153,7 +153,7 @@ docker run --rm \
   "${IMAGE}" \
   -lc '
     cp /sgl-workspace/aiter/aiter/ops/mha.py /target/aiter/ops/mha.py
-    cp -a /sgl-workspace/aiter/aiter/jit/*.so /target/aiter/jit/
+    cp -a /sgl-workspace/aiter/aiter/jit/*mha*.so /target/aiter/jit/
     printf "DSV41_AITER_MHA_SHA256 "
     sha256sum /target/aiter/ops/mha.py
   '
