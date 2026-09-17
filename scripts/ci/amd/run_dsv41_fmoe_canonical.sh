@@ -222,6 +222,7 @@ port="$2"
 duration="$3"
 warmup="$4"
 
+export INFMAX_CONTAINER_WORKSPACE=/ix
 source /ix/benchmarks/benchmark_lib.sh
 export MODEL=deepseek-ai/DeepSeek-V4.1-Flash
 export MODEL_PREFIX=dsv41flash
@@ -239,7 +240,6 @@ export AIPERF_SERVER_METRICS_URLS="${AIPERF_SERVER_URL}/metrics"
 export AIPERF_REQUIRED_SERVER_METRIC_PREFIX="sglang:"
 export AIPERF_DATASET_MMAP_CACHE_DIR=/aiperf_mmap_cache
 export AIPERF_HTTP_TCP_USER_TIMEOUT=900000
-export INFMAX_CONTAINER_WORKSPACE=/ix
 export AGENTIC_OUTPUT_DIR="${RESULT_DIR}"
 export AIPERF_WARMUP_REQUESTS_PER_LANE="${warmup}"
 
