@@ -99,9 +99,17 @@ PY
 mapfile -t gpu_ids <"${root}/gpu_ids"
 echo "DSV41_PREFLIGHT host=$(hostname) gpus=${gpu_ids[*]} at=$(date -Is)"
 
+mapfile -t render_devices < <(
+  printf '%s\n' /dev/dri/renderD* | sort -V
+)
 device_args=(--device=/dev/kfd)
 for gpu_id in "${gpu_ids[@]}"; do
-  device_args+=("--device=/dev/dri/renderD$((128 + gpu_id))")
+  render_device="${render_devices[gpu_id]:-}"
+  if [[ ! -c "${render_device}" ]]; then
+    echo "no render device for GPU ${gpu_id}: ${render_device:-missing}"
+    exit 1
+  fi
+  device_args+=("--device=${render_device}")
 done
 
 python3 - "${PORT}" "${NCCL_PORT}" <<'PY'
@@ -382,7 +390,7 @@ curl -fsS "http://127.0.0.1:${PORT}/health" >/dev/null
 test "$(docker inspect -f '{{.State.Running}}' "${server_name}")" = "true"
 stop_server candidate-b2
 
-trace_device_args=(--device=/dev/kfd "--device=/dev/dri/renderD$((128 + gpu_ids[0]))")
+trace_device_args=(--device=/dev/kfd "--device=${render_devices[gpu_ids[0]]}")
 if docker run --rm \
   --label "spur_job_id=${SPUR_JOB_ID}" \
   "${trace_device_args[@]}" \
