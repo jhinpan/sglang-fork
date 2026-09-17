@@ -1,0 +1,124 @@
+{
+  "schema_version": 1,
+  "date": "2026-09-17",
+  "target": {
+    "model": "DeepSeek-V4.1-Flash",
+    "gpu": "MI355X",
+    "gfx": "gfx950",
+    "cu_num": 256,
+    "tp": 4,
+    "ep": 4,
+    "global_experts": 384,
+    "local_experts": 96,
+    "topk": 6,
+    "hidden": 5120,
+    "intermediate": 2304,
+    "activation": "Silu",
+    "swiglu_limit": 10.0,
+    "routed_scaling_factor": 1.5,
+    "activation_quant": "per_1x32 MXFP8 with E8M0 scale",
+    "weight_quant": "per_1x32 MXFP4"
+  },
+  "source": {
+    "sglang_pr_39857_head": "7791f6c81b3958b9b2b9f99e135604f59052b467",
+    "sglang_ep_topk_commit": "064d341c",
+    "aiter_base": "ded4e2217f3cf1da528e27d4b101f79ebd1e6b34",
+    "aiter_full_retune_source": "73ea17e03",
+    "aiter_real_ep_winner_source": "4a1241e66",
+    "container": "lmsysorg/sglang:dev-dsv41-mi35x@sha256:c609f74f01b206af9664fb66da8ebef47642a7328a2478eabeebb352e014661a",
+    "torch": "2.11.0+rocm7.2",
+    "rocm": "7.2.26015",
+    "flydsl": "0.3.2"
+  },
+  "method": {
+    "seed": 42,
+    "routing": "balanced global routes with four explicit local expert masks",
+    "objective": "maximum latency across EP ranks",
+    "execution": "CUDA Graph",
+    "paired_rounds": 5,
+    "iterations_per_round": 100,
+    "minimum_speedup_percent": 3.0,
+    "correctness": [
+      "finite output",
+      "bitwise replay stability",
+      "paired output delta",
+      "full sort-to-route-reduce composition"
+    ]
+  },
+  "promoted": {
+    "tokens": [
+      1,
+      8,
+      16,
+      32,
+      64,
+      128,
+      256,
+      512,
+      1024,
+      2048,
+      4096,
+      8192,
+      16384
+    ],
+    "fallback_tokens": [
+      2,
+      4
+    ],
+    "retuned_tokens": [
+      4096
+    ]
+  },
+  "rejected": [
+    {
+      "candidate": "imported rows for M=2 and M=4",
+      "reason": "slower than fallback on the maximum-latency rank",
+      "speedup": {
+        "2": 0.9663,
+        "4": 0.9693
+      }
+    },
+    {
+      "candidate": "SBM16",
+      "reason": "output mismatch",
+      "relative_l2_range": [
+        0.8667,
+        0.9605
+      ]
+    },
+    {
+      "candidate": "atomic stage2",
+      "reason": "replay is not bitwise deterministic under skewed routing",
+      "repeat_max_abs_delta_range": [
+        0.0078125,
+        0.03125
+      ]
+    },
+    {
+      "candidate": "FP8 route buffer and deterministic reducer",
+      "reason": "adds a second quantization error and does not improve small-M",
+      "relative_l2": 0.0268
+    },
+    {
+      "candidate": "compact A1 scale",
+      "reason": "the available compact consumer is FP4-only and rejects A8W4"
+    },
+    {
+      "candidate": "synthetic full-retune winners except M=4096",
+      "reason": "failed the real EP4 maximum-rank threshold or regressed"
+    }
+  ],
+  "run_ids": [
+    789,
+    792,
+    793,
+    794,
+    798,
+    809,
+    816,
+    818,
+    820,
+    822,
+    824
+  ]
+}

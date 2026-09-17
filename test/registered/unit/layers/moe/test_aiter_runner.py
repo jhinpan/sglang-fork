@@ -1,4 +1,7 @@
+import csv
+import json
 import sys
+from pathlib import Path
 from types import ModuleType, SimpleNamespace
 
 import pytest
@@ -15,6 +18,12 @@ from sglang.srt.layers.moe.moe_runner.base import MoeRunnerConfig
 from sglang.test.ci.ci_register import register_cpu_ci
 
 register_cpu_ci(est_time=7, suite="stage-b-test-cpu-intel")
+
+_DSV41_CONFIG = (
+    Path(__file__).parents[5]
+    / "docker/configs/rocm/aiter_fmoe_gfx950_dsv41_ep4_a8w4.csv"
+)
+_DSV41_PROVENANCE = _DSV41_CONFIG.with_suffix(".provenance.json")
 
 
 def _runner_input():
@@ -122,6 +131,18 @@ def test_aiter_runner_preserves_no_combine_rank_for_empty_input(monkeypatch):
     output = runner.run(runner_input, _quant_info(), running_state={})
 
     assert output.hidden_states.shape == (0, 2, 4)
+
+
+def test_dsv41_tuning_rows_match_real_ep_topk_and_provenance():
+    with _DSV41_CONFIG.open(newline="") as stream:
+        rows = list(csv.DictReader(stream))
+    provenance = json.loads(_DSV41_PROVENANCE.read_text())
+
+    tokens = {int(row["token"]) for row in rows}
+    assert tokens == set(provenance["promoted"]["tokens"])
+    assert {2, 4}.isdisjoint(tokens)
+    assert {row["topk"] for row in rows} == {"6"}
+    assert provenance["promoted"]["fallback_tokens"] == [2, 4]
 
 
 if __name__ == "__main__":
