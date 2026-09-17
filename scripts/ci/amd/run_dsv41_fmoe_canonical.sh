@@ -260,6 +260,7 @@ start_server() {
     -e AITER_FLYDSL_STAGE2_FP8=0 \
     -e ROCM_QUICK_REDUCE_QUANTIZATION=NONE \
     -e AITER_ONLINE_TUNE=0 \
+    -e AITER_AOT_IMPORT=0 \
     -e AITER_BF16_FP8_MOE_BOUND=0 \
     -e TRITON_HIP_USE_ASYNC_COPY=0 \
     -e SGLANG_DSV41_REASONING_EFFORT=high \
@@ -399,6 +400,7 @@ if docker run --rm \
   --network=host \
   -e PYTHONPATH=/src/aiter \
   -e AITER_LOG_LEVEL=ERROR \
+  -e AITER_AOT_IMPORT=0 \
   -e AITER_BF16_FP8_MOE_BOUND=0 \
   -e TRITON_HIP_USE_ASYNC_COPY=0 \
   -v "${src}:/src" \
