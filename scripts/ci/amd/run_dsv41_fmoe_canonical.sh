@@ -65,26 +65,35 @@ mkdir -p \
   "${root}/trace"
 
 rocm-smi --showmeminfo vram --json >"${root}/preflight.json"
-python3 - "${root}/preflight.json" >"${root}/gpu_ids" <<'PY'
+visible_devices="${HIP_VISIBLE_DEVICES:-${ROCR_VISIBLE_DEVICES:-}}"
+python3 - "${root}/preflight.json" "${visible_devices}" >"${root}/gpu_ids" <<'PY'
 import json
 import sys
 
 data = json.load(open(sys.argv[1]))
-used = {}
+observed = {}
 for card, values in data.items():
-    used[int(card.removeprefix("card"))] = int(
+    observed[int(card.removeprefix("card"))] = int(
         next(
             value
             for key, value in values.items()
             if "Total Used Memory" in key
         )
     )
-if len(used) != 4:
-    raise SystemExit(f"expected 4 allocated GPUs, observed {len(used)}: {used}")
+selected = (
+    [int(value) for value in sys.argv[2].split(",") if value]
+    if sys.argv[2]
+    else sorted(observed)
+)
+if len(selected) != 4 or any(card not in observed for card in selected):
+    raise SystemExit(
+        f"expected 4 allocated GPUs, selected={selected}, observed={observed}"
+    )
+used = {card: observed[card] for card in selected}
 dirty = {card: value for card, value in used.items() if value > 5 * 2**30}
 if dirty:
     raise SystemExit(f"allocated GPUs are not clean: {dirty}")
-for card in sorted(used):
+for card in selected:
     print(card)
 PY
 mapfile -t gpu_ids <"${root}/gpu_ids"
@@ -132,8 +141,10 @@ git -C "${src}/InferenceX" submodule update --init --depth 1 utils/aiperf
 cat >"${root}/hbm_sampler.py" <<'PY'
 import json
 import subprocess
+import sys
 import time
 
+selected = {f"card{value}" for value in sys.argv[1:]}
 while True:
     now = time.time()
     run = subprocess.run(
@@ -145,6 +156,8 @@ while True:
     if run.returncode == 0:
         try:
             for card, values in json.loads(run.stdout).items():
+                if card not in selected:
+                    continue
                 used = next(
                     int(value)
                     for key, value in values.items()
@@ -347,7 +360,7 @@ run_client() {
   echo "DSV41_CLIENT_DONE name=${name} at=$(date -Is)"
 }
 
-python3 "${root}/hbm_sampler.py" >"${root}/hbm.jsonl" 2>&1 &
+python3 "${root}/hbm_sampler.py" "${gpu_ids[@]}" >"${root}/hbm.jsonl" 2>&1 &
 sampler_pid="$!"
 
 start_server baseline-a1 "${baseline_config}"
