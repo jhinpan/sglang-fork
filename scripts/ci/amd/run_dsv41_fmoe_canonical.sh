@@ -287,8 +287,10 @@ start_server() {
     -e HF_HUB_OFFLINE=1 \
     -e HF_DATASETS_OFFLINE=1 \
     -e PYTHONUNBUFFERED=1 \
+    -e PYTHONPATH=/src/sglang/python \
     -e "AITER_CONFIG_FMOE=${config}" \
     -v "${model}:/models/DeepSeek-V4.1-Flash:ro" \
+    -v "${src}/sglang:/src/sglang" \
     -v "${root}/candidate-runtime.csv:/config/dsv41.csv:ro" \
     --entrypoint '' \
     "${IMAGE}" \
