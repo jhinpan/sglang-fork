@@ -73,18 +73,27 @@ def test_aiter_runner_forwards_no_combine_and_extra_fused_moe_kwargs(monkeypatch
     monkeypatch.setattr(
         aiter_runner, "_aiter_fused_moe_supports_no_combine", lambda: True
     )
+    monkeypatch.setattr(
+        aiter_runner,
+        "_aiter_fused_moe_supports_ep_has_fake_expert",
+        lambda: True,
+    )
 
     runner = AiterRunnerCore(MoeRunnerConfig(activation="silu", no_combine=True))
 
     runner.run(
         _runner_input(),
-        _quant_info(fused_moe_kwargs={"custom_fused_moe_kwarg": "enabled"}),
+        _quant_info(
+            expert_mask=torch.ones(2, dtype=torch.int32),
+            fused_moe_kwargs={"custom_fused_moe_kwarg": "enabled"},
+        ),
         running_state={},
     )
 
     assert captured["activation"] == "Silu"
     assert captured["quant_type"] == "per_1x32"
     assert captured["no_combine"] is True
+    assert captured["ep_has_fake_expert"] is False
     assert captured["custom_fused_moe_kwarg"] == "enabled"
 
 

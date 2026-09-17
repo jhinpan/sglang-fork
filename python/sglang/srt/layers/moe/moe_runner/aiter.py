@@ -138,6 +138,14 @@ def _aiter_fused_moe_supports_no_combine() -> bool:
     return "no_combine" in inspect.signature(fused_moe).parameters
 
 
+@functools.cache
+def _aiter_fused_moe_supports_ep_has_fake_expert() -> bool:
+    """Probe whether AITER can preserve an EP route-only top-k tuning key."""
+    from aiter.fused_moe import fused_moe
+
+    return "ep_has_fake_expert" in inspect.signature(fused_moe).parameters
+
+
 # aiter has no hook for a caller's sort: moe_sorting is wrapped once and answers only inside a scope
 
 
@@ -596,6 +604,13 @@ class AiterRunnerCore(MoeRunnerCore):
             extra["num_local_tokens"] = runner_input.num_local_tokens
         if runner_input.output_dtype is not None:
             extra["dtype"] = runner_input.output_dtype
+        if (
+            quant_info.expert_mask is not None
+            and _aiter_fused_moe_supports_ep_has_fake_expert()
+        ):
+            # SGLang routes only real experts here. The legacy AITER convention
+            # subtracts an always-masked fake slot that this path never appends.
+            extra["ep_has_fake_expert"] = False
         if self.config.activation == "situ":
             from aiter.ops.flydsl.moe_common import GateMode
 
