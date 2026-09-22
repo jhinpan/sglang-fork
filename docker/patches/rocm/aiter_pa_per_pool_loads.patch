@@ -1,0 +1,74 @@
+diff --git a/aiter/ops/triton/attention/pa_decode_sparse.py b/aiter/ops/triton/attention/pa_decode_sparse.py
+--- a/aiter/ops/triton/attention/pa_decode_sparse.py
++++ b/aiter/ops/triton/attention/pa_decode_sparse.py
+@@ -521,7 +521,6 @@
+         main_block, extra_block = 1, 1
+         nope_dim = head_dim
+         main_num_rows = extra_num_rows = cache.shape[0]
+-        cache_bytes = max_addressable_bytes(cache)
+         avg_main = indices.numel() / max(1, num_queries)  # one segment; no extra
+         avg_extra = 0.0
+     else:
+@@ -545,13 +544,17 @@
+         nope_dim = NOPE_DIM
+         main_num_rows = cache.shape[0] * cache.shape[1]
+         extra_num_rows = extra_cache.shape[0] * extra_cache.shape[1]
+-        cache_bytes = max(
+-            max_addressable_bytes(cache), max_addressable_bytes(extra_cache)
+-        )
+         avg_main = indices.numel() / max(1, num_queries)
+         avg_extra = extra_indices.numel() / max(1, num_queries) if has_extra else 0.0
+
+-    use_buffer_load = cache_bytes < MAX_BYTES
++    # Each pool has its own offset range. A large extra pool must not disable
++    # buffer loads for a small main pool (or vice versa).
++    main_use_buffer_load = max_addressable_bytes(cache) < MAX_BYTES
++    extra_use_buffer_load = (
++        max_addressable_bytes(extra_cache) < MAX_BYTES
++        if has_extra
++        else main_use_buffer_load
++    )
+     HEAD_ALIGNED = num_heads % BLOCK_M == 0
+     heads_blocks = (num_heads + BLOCK_M - 1) // BLOCK_M
+     out = torch.empty_like(q, dtype=torch.bfloat16)
+@@ -629,7 +632,8 @@
+         HEAD_ALIGNED=HEAD_ALIGNED,
+         MFMA_K=MFMA_K,
+         UNIFORM=UNIFORM,
+-        USE_BUFFER_LOAD=use_buffer_load,
++        MAIN_USE_BUFFER_LOAD=main_use_buffer_load,
++        EXTRA_USE_BUFFER_LOAD=extra_use_buffer_load,
+         HAS_INVALID=has_invalid,
+         FP8_FNUZ=fp8_fnuz,
+         num_warps=num_warps,
+diff --git a/aiter/ops/triton/_gluon_kernels/gfx950/attention/pa_decode_sparse.py b/aiter/ops/triton/_gluon_kernels/gfx950/attention/pa_decode_sparse.py
+--- a/aiter/ops/triton/_gluon_kernels/gfx950/attention/pa_decode_sparse.py
++++ b/aiter/ops/triton/_gluon_kernels/gfx950/attention/pa_decode_sparse.py
+@@ -667,7 +667,8 @@
+     HEAD_ALIGNED: gl.constexpr,
+     MFMA_K: gl.constexpr,
+     UNIFORM: gl.constexpr,
+-    USE_BUFFER_LOAD: gl.constexpr,
++    MAIN_USE_BUFFER_LOAD: gl.constexpr,
++    EXTRA_USE_BUFFER_LOAD: gl.constexpr,
+     HAS_INVALID: gl.constexpr,
+     FP8_FNUZ: gl.constexpr,
+ ):
+@@ -800,7 +801,7 @@
+         BLOCK_K,
+         HEAD_ALIGNED,
+         UNIFORM,
+-        USE_BUFFER_LOAD,
++        MAIN_USE_BUFFER_LOAD,
+         HAS_INVALID,
+         FP8_FNUZ,
+     )
+@@ -845,7 +846,7 @@
+             BLOCK_K,
+             HEAD_ALIGNED,
+             UNIFORM,
+-            USE_BUFFER_LOAD,
++            EXTRA_USE_BUFFER_LOAD,
+             HAS_INVALID,
+             FP8_FNUZ,
+         )

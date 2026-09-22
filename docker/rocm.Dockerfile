@@ -573,6 +573,8 @@ RUN pip uninstall -y aiter
 COPY docker/patches/rocm/aiter_flydsl_moe_stage1_lds_dma_drain.patch /tmp/aiter_patches/
 # gfx950 BF16 SiLU dispatch and clamp fix; drop once included in its AITER pin.
 COPY docker/patches/rocm/aiter_moe_bf16_silu.patch /tmp/aiter_patches/
+# Per-pool sparse PA loads from ROCm/aiter#4919, backported to the current pin.
+COPY docker/patches/rocm/aiter_pa_per_pool_loads.patch /tmp/aiter_patches/
 # apply fix for v4 fp4 indexer, may be removed in next aiter upgrade
 RUN git clone ${AITER_REPO} \
  && cd aiter \
@@ -582,6 +584,10 @@ RUN git clone ${AITER_REPO} \
  && git apply --verbose /tmp/aiter_patches/aiter_flydsl_moe_stage1_lds_dma_drain.patch \
  && if [ "${GPU_ARCH_LIST}" = "gfx950" ]; then \
       git apply --verbose /tmp/aiter_patches/aiter_moe_bf16_silu.patch; \
+    fi \
+ && if [ "${GPU_ARCH_LIST}" = "gfx950" ] \
+      && [ "$(git rev-parse HEAD)" = "4ad99832823dde2315b361cbd3b54b1c5c12acd5" ]; then \
+      git apply --verbose /tmp/aiter_patches/aiter_pa_per_pool_loads.patch; \
     fi \
  && sed -i 's/from functools import lru_cache/from functools import cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \
  && sed -i 's/@lru_cache(maxsize=32)/@cache/' aiter/ops/flydsl/kernels/mqa_logits/pa_mqa_logits_fp4_prefill.py \

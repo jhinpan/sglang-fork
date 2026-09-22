@@ -1,8 +1,10 @@
 """The ``aiter_sparse`` ROCm attention backend and its split-KV combine must match the torch reference and aiter's own reduce on the served packed fp8 KV layout, bitwise repeatable and batch-invariant."""
 
+import importlib
 import math
 import unittest
 from types import SimpleNamespace
+from unittest import mock
 
 import torch
 
@@ -10,7 +12,7 @@ from sglang.srt.utils import is_gfx95_supported, is_hip
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.test_utils import CustomTestCase
 
-register_amd_ci(est_time=25, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
+register_amd_ci(est_time=45, suite="stage-b-kernel-test-1-gpu-amd-mi35x")
 
 
 NOPE, ROPE, D = 448, 64, 512
@@ -24,9 +26,9 @@ SCALE = D**-0.5
 TOL_SHORT = 1e-2
 
 
-def _pack_cache(num_blocks, device, gen, *, fp8_view=True):
+def _pack_cache(num_blocks, device, gen, *, fp8_view=True, page=PAGE):
     """Random bf16 keys in the packed fp8 layout: cache [num_blocks, PAGE, 1, BYTES] and the dequantized keys [slots, D] fp32."""
-    slots = num_blocks * PAGE
+    slots = num_blocks * page
     k = torch.randn(slots, D, generator=gen) * 0.5
     nope = k[:, :NOPE].reshape(slots, NOPE // 64, 64)
     amax = nope.abs().amax(-1, keepdim=True).clamp(min=1e-6)
@@ -35,13 +37,13 @@ def _pack_cache(num_blocks, device, gen, *, fp8_view=True):
     nope_fp8 = (nope / scale).to(torch.float8_e4m3fn)
     nope_deq = nope_fp8.float() * scale
     rope = k[:, NOPE:].to(torch.bfloat16)
-    raw = torch.zeros(num_blocks, PAGE * BYTES, dtype=torch.uint8)
-    data = raw[:, : PAGE * 576].view(num_blocks, PAGE, 576)
-    data[:, :, :NOPE] = nope_fp8.view(torch.uint8).reshape(num_blocks, PAGE, NOPE)
-    data[:, :, NOPE:] = rope.view(torch.uint8).reshape(num_blocks, PAGE, 2 * ROPE)
-    scales = raw[:, PAGE * 576 :].view(num_blocks, PAGE, 8)
-    scales[:, :, :7] = (exp.reshape(num_blocks, PAGE, 7) + 127).to(torch.uint8)
-    cache = raw.view(num_blocks, PAGE, 1, BYTES)
+    raw = torch.zeros(num_blocks, page * BYTES, dtype=torch.uint8)
+    data = raw[:, : page * 576].view(num_blocks, page, 576)
+    data[:, :, :NOPE] = nope_fp8.view(torch.uint8).reshape(num_blocks, page, NOPE)
+    data[:, :, NOPE:] = rope.view(torch.uint8).reshape(num_blocks, page, 2 * ROPE)
+    scales = raw[:, page * 576 :].view(num_blocks, page, 8)
+    scales[:, :, :7] = (exp.reshape(num_blocks, page, 7) + 127).to(torch.uint8)
+    cache = raw.view(num_blocks, page, 1, BYTES)
     if fp8_view:
         cache = cache.view(torch.float8_e4m3fn)
     deq = torch.cat([nope_deq.reshape(slots, NOPE), rope.float()], dim=1).to(device)
@@ -57,18 +59,18 @@ def _masked(indices, lengths):
     return _fold_lengths_into_index_lists(indices, lengths)[0]
 
 
-def _decode_case(batch, heads, gen, dev):
+def _decode_case(batch, heads, gen, dev, *, extra_page=PAGE):
     """Two SWA and five top-k pages of packed keys, a query per row, the sink, and one
     random 128-slot SWA list plus one 512-slot top-k list per row ([b, 1, w] int32)."""
     swa_cache, swa_deq = _pack_cache(2, dev, gen)
-    topk_cache, topk_deq = _pack_cache(5, dev, gen)
+    topk_cache, topk_deq = _pack_cache(5, dev, gen, page=extra_page)
     q = (torch.randn(batch, 1, heads, D, generator=gen) * 0.5).to(torch.bfloat16)
     sink = (torch.randn(heads, generator=gen) * 0.5).to(dev)
     swa_idx = torch.stack(
         [torch.randperm(2 * PAGE, generator=gen)[:128] for _ in range(batch)]
     )
     topk_idx = torch.stack(
-        [torch.randperm(5 * PAGE, generator=gen)[:512] for _ in range(batch)]
+        [torch.randperm(5 * extra_page, generator=gen)[:512] for _ in range(batch)]
     )
     return SimpleNamespace(
         swa_cache=swa_cache,
@@ -158,6 +160,108 @@ class TestAiterSparseBackend(CustomTestCase):
         a 5-key list a stray key moves the softmax mass past this tolerance, where the
         640-key cases absorb it."""
         self._assert_matches_reference(2, 16, [2, 3], [4, 5], seed=6, tol=TOL_SHORT)
+
+    def test_independent_pool_loads_above_int32_range(self):
+        """Small pools keep buffer loads while either pool may address past 2 GiB."""
+        from sglang.srt.layers.attention.hip_flash_mla import aiter_sparse_decode_fwd
+
+        pa = importlib.import_module("aiter.ops.triton.attention.pa_decode_sparse")
+        # AITER #4919 renamed the kernel; exercise the pinned and newer drivers.
+        kernel_name = (
+            "_pa_decode_sparse_gfx950"
+            if hasattr(pa, "_pa_decode_sparse_gfx950")
+            else "_sparse_mla_gfx950"
+        )
+        kernel = getattr(pa, kernel_name)
+        routes = []
+
+        class RecordLaunch:
+            def __getitem__(self, grid):
+                def launch(*args, **kwargs):
+                    shared = kwargs.get("USE_BUFFER_LOAD")
+                    routes.append(
+                        (
+                            kwargs.get("MAIN_USE_BUFFER_LOAD", shared),
+                            kwargs.get("EXTRA_USE_BUFFER_LOAD", shared),
+                        )
+                    )
+                    return kernel[grid](*args, **kwargs)
+
+                return launch
+
+        def high_cache(cache, indices):
+            page = cache.shape[1]
+            stride = page * BYTES
+            shift = 2**31 // stride + 2
+            shape = (shift + cache.shape[0], *cache.shape[1:])
+            # A nonzero storage offset also exercises the cache's typed views.
+            raw = torch.zeros(
+                math.prod(shape) + 16, dtype=torch.uint8, device=cache.device
+            )
+            expanded = raw[16:].view(cache.dtype).view(shape)
+            expanded[shift:].copy_(cache)
+            shifted = torch.where(indices >= 0, indices + shift * page, -1)
+            self.assertGreater(shift * stride, 2**31)
+            self.assertTrue((shifted[shifted >= 0] >= shift * page).all().item())
+            return expanded, shifted
+
+        for page in (128, 256):
+            for main_large, extra_large in (
+                (False, False),
+                (False, True),
+                (True, False),
+                (True, True),
+            ):
+                with self.subTest(page=page, main=main_large, extra=extra_large):
+                    gen = torch.Generator(device="cpu").manual_seed(4919)
+                    c = _decode_case(6, 16, gen, torch.device("cuda"), extra_page=page)
+                    c.swa_idx[..., 3] = -1
+                    c.topk_idx[..., 7] = -1
+                    c.swa_idx[0] = -1
+                    c.topk_idx[0] = -1
+                    sets = [
+                        (c.swa_deq, c.swa_idx.clone()),
+                        (c.topk_deq, c.topk_idx.clone()),
+                    ]
+                    if main_large:
+                        c.swa_cache, c.swa_idx = high_cache(c.swa_cache, c.swa_idx)
+                    if extra_large:
+                        c.topk_cache, c.topk_idx = high_cache(c.topk_cache, c.topk_idx)
+                    padded_q = torch.empty(
+                        (6, 1, 17, D + 8), dtype=c.q.dtype, device=c.q.device
+                    )
+                    q = padded_q[:, :, :16, 4 : D + 4]
+                    q.copy_(c.q)
+
+                    def run():
+                        return aiter_sparse_decode_fwd(
+                            q,
+                            c.swa_cache,
+                            c.swa_idx,
+                            c.sink,
+                            SCALE,
+                            extra_k_cache=c.topk_cache,
+                            extra_indices_in_kvcache=c.topk_idx,
+                        )[0]
+
+                    routes.clear()
+                    with mock.patch.object(pa, kernel_name, RecordLaunch()):
+                        run()
+                        run()
+                        graph = torch.cuda.CUDAGraph()
+                        with torch.cuda.graph(graph):
+                            graph_out = run()
+                        for scale in (1.0, -0.75):
+                            q.copy_(c.q * scale)
+                            expected = run().clone()
+                            ref = _reference_prefill(q, c.sink, sets)
+                            error = (expected.float() - ref).abs().max()
+                            self.assertLess(error.item(), 0.03 * ref.abs().max().item())
+                            graph_out.fill_(float("nan"))
+                            graph.replay()
+                            self.assertTrue(torch.equal(graph_out, expected))
+                    self.assertTrue(routes)
+                    self.assertEqual(set(routes), {(not main_large, not extra_large)})
 
 
 SWA, TOPK = 128, 512
