@@ -21,9 +21,12 @@ from sglang.kernels.ops.attention.dsv4.unified_kv_kernels import runtime
 from sglang.kernels.ops.speculative.dspark import dspark_verify_window
 from sglang.srt.layers.attention.deepseek_v4_backend_hip_radix import (
     DeepseekV4HipRadixBackend,
+    DSV4RawDraftBlockMetadata,
     DSV4RawVerifyMetadata,
     UnifiedKvMetadata,
+    _GraphBucket,
 )
+from sglang.srt.model_executor.forward_batch_info import ForwardMode
 from sglang.srt.utils import kill_process_tree
 from sglang.test.ci.ci_register import register_amd_ci
 from sglang.test.few_shot_gsm8k import run_eval as run_eval_few_shot_gsm8k
@@ -120,6 +123,64 @@ class TestDSparkUnifiedKVKernelsAMD(CustomTestCase):
                 else:
                     self.assertIs(result, eager_metadata)
                     backend.init_forward_metadata_target_verify_old.assert_called_once()
+
+    def test_dspark_draft_block_metadata_built_in_graph(self):
+        bs, block_size, max_seq_len = 3, 5, 4096
+        backend = DeepseekV4HipRadixBackend.__new__(DeepseekV4HipRadixBackend)
+        backend.is_dspark_draft = True
+        backend.target_verify_num_draft_tokens = block_size
+        backend.MAX_SEQ_LEN_FOR_CAPTURE = max_seq_len
+        backend.needs_cpu_seq_lens = False
+        backend.enable_deepseek_v4_fp4_indexer = False
+        backend.cuda_int32_kwargs = dict(device=DEVICE, dtype=torch.int32)
+        backend.cuda_graph_metadata_of_bucket_and_bs = {b: {} for b in _GraphBucket}
+        backend.token_to_kv_pool = SimpleNamespace(request_window=None)
+        built = object()
+        backend.init_forward_metadata_dspark_draft_block = mock.Mock(return_value=built)
+
+        def draft_batch(seq_len, loc):
+            return SimpleNamespace(
+                forward_mode=ForwardMode.TARGET_VERIFY,
+                batch_size=bs,
+                req_pool_indices=torch.arange(bs, device=DEVICE, dtype=torch.int32),
+                seq_lens=torch.full((bs,), seq_len, device=DEVICE, dtype=torch.int32),
+                seq_lens_cpu=None,
+                positions=torch.zeros(
+                    bs * block_size, device=DEVICE, dtype=torch.int64
+                ),
+                out_cache_loc=torch.full(
+                    (bs * block_size,), loc, device=DEVICE, dtype=torch.int32
+                ),
+            )
+
+        # Capture records only the graph inputs; no eager metadata build.
+        backend.init_forward_metadata_out_graph(draft_batch(7, 0), in_capture=True)
+        raw = backend.forward_metadata
+        self.assertIsInstance(raw, DSV4RawDraftBlockMetadata)
+        self.assertIs(backend._current_capture_raw, raw)
+        backend.init_forward_metadata_dspark_draft_block.assert_not_called()
+
+        # Inside the graph the raw inputs expand at the capture sequence bound.
+        backend.init_forward_metadata_in_graph(draft_batch(7, 0))
+        self.assertIs(backend.forward_metadata, built)
+        call = backend.init_forward_metadata_dspark_draft_block.call_args.kwargs
+        self.assertEqual(call["max_seq_len"], max_seq_len)
+        self.assertEqual(call["block_size"], block_size)
+        self.assertIs(call["seq_lens"], raw.seq_lens)
+        self.assertIs(call["out_cache_loc"], raw.out_cache_loc)
+
+        # Replay refreshes the captured tensors in place and builds nothing.
+        captured = (raw.req_pool_indices, raw.seq_lens, raw.out_cache_loc)
+        replay = draft_batch(9, 11)
+        backend.init_forward_metadata_out_graph(replay, in_capture=False)
+        self.assertIs(backend.forward_metadata, raw)
+        for before, after in zip(
+            captured, (raw.req_pool_indices, raw.seq_lens, raw.out_cache_loc)
+        ):
+            self.assertIs(before, after)
+        self.assertTrue(torch.equal(raw.seq_lens, replay.seq_lens))
+        self.assertTrue(torch.equal(raw.out_cache_loc, replay.out_cache_loc))
+        backend.init_forward_metadata_dspark_draft_block.assert_called_once()
 
     def test_build_unified_commit_inject_layout(self):
         stride, ring_stride = 7, 128

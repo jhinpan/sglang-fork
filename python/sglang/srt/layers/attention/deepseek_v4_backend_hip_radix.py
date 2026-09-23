@@ -747,6 +747,19 @@ class DSV4RawDecodeMetadata:
         self.out_cache_loc.copy_(other.out_cache_loc)
 
 
+@dataclass
+class DSV4RawDraftBlockMetadata:
+    req_pool_indices: torch.Tensor
+    seq_lens: torch.Tensor
+    out_cache_loc: torch.Tensor
+    block_size: int
+
+    def copy_(self, other: DSV4RawDraftBlockMetadata):
+        self.req_pool_indices.copy_(other.req_pool_indices)
+        self.seq_lens.copy_(other.seq_lens)
+        self.out_cache_loc.copy_(other.out_cache_loc)
+
+
 class _GraphBucket(enum.Enum):
     DECODE_OR_IDLE = "decode_or_idle"
     TARGET_VERIFY = "target_verify"
@@ -906,6 +919,7 @@ class DeepseekV4HipRadixBackend(
             DSV4Metadata,
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
+            DSV4RawDraftBlockMetadata,
         ] = None
 
     def _move_to_device(self, x: List[int]) -> torch.Tensor:
@@ -1511,6 +1525,15 @@ class DeepseekV4HipRadixBackend(
             self.forward_metadata = self.make_forward_metadata_from_raw_decode(
                 raw_metadata=self.forward_metadata,
             )
+        elif isinstance(self.forward_metadata, DSV4RawDraftBlockMetadata):
+            raw = self.forward_metadata
+            self.forward_metadata = self.init_forward_metadata_dspark_draft_block(
+                max_seq_len=self.MAX_SEQ_LEN_FOR_CAPTURE,
+                req_pool_indices=raw.req_pool_indices,
+                seq_lens=raw.seq_lens,
+                out_cache_loc=raw.out_cache_loc,
+                block_size=raw.block_size,
+            )
 
         metadata = self.forward_metadata
         if isinstance(metadata, DSV4Metadata):
@@ -1764,8 +1787,9 @@ class DeepseekV4HipRadixBackend(
                 mode="constant",
                 value=0,
             )
-            temp_metadata = self.init_forward_metadata_dspark_draft_block(
-                max_seq_len=chosen_max_seq_len,
+            # Built inside the draft graph like the raw verify path, so a replay
+            # only refreshes these three inputs.
+            temp_metadata = DSV4RawDraftBlockMetadata(
                 req_pool_indices=req_pool_indices,
                 seq_lens=seq_lens,
                 out_cache_loc=out_cache_loc_padded,
@@ -1835,7 +1859,11 @@ class DeepseekV4HipRadixBackend(
                 metadata
                 if isinstance(
                     metadata,
-                    (DSV4RawDecodeMetadata, DSV4RawVerifyMetadata),
+                    (
+                        DSV4RawDecodeMetadata,
+                        DSV4RawVerifyMetadata,
+                        DSV4RawDraftBlockMetadata,
+                    ),
                 )
                 else None
             )
@@ -2271,6 +2299,7 @@ class DeepseekV4HipRadixBackend(
                     DSV4Metadata,
                     DSV4RawDecodeMetadata,
                     DSV4RawVerifyMetadata,
+                    DSV4RawDraftBlockMetadata,
                 ],
             ],
         ] = {bucket: {} for bucket in _GraphBucket}
@@ -2285,6 +2314,7 @@ class DeepseekV4HipRadixBackend(
             DSV4Metadata,
             DSV4RawVerifyMetadata,
             DSV4RawDecodeMetadata,
+            DSV4RawDraftBlockMetadata,
         ],
         bucket: _GraphBucket,
     ) -> None:
