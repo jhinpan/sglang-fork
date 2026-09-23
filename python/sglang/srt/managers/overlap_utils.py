@@ -266,6 +266,9 @@ class FutureMap:
         # full decision (per-backend flag + TBO / piecewise CG overrides).
         self.needs_cpu_seq_lens = needs_cpu_seq_lens
         self.needs_confidence_relay = needs_confidence_relay
+        # Set by the scheduler when it schedules on the forward stream (HIP with
+        # speculative decoding); publish waits then stay in that queue.
+        self.same_queue_publish = False
         self.req_pool_size = req_to_token_pool.req_to_token.shape[0]
         # Kept for the mixed-tail late binding (reserved-slot gather).
         self.req_to_token = req_to_token_pool.req_to_token
@@ -475,7 +478,7 @@ class FutureMap:
         if n == 0:
             return
         if self.publish_ready is not None:
-            if _is_hip:
+            if _is_hip and not self.same_queue_publish:
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
@@ -527,8 +530,9 @@ class FutureMap:
                 # forward publish; a stale consume means a publish went missing.
                 assert self._publish_fresh, "resolve without a fresh forward publish"
                 self._publish_fresh = False
-            if _is_hip:
-                # Temporary workaround: Event.wait() regresses TPOT on AMD MI355.
+            if _is_hip and not self.same_queue_publish:
+                # A device wait left pending in another HIP queue while the forward
+                # graph runs slows every dispatch of that graph, so block the host.
                 self.publish_ready.synchronize()
             else:
                 self.publish_ready.wait()
