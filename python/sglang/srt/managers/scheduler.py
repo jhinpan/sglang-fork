@@ -1863,6 +1863,19 @@ class Scheduler(
                 self.schedule_stream = allocate_distinct_stream(
                     self.device_module, (self.forward_stream,)
                 )
+        if (
+            _is_hip
+            and self.enable_overlap
+            and self.spec_algorithm.is_some()
+            and get_parallel().pp_size == 1
+        ):
+            # A device wait pending in another HW queue slows every dispatch of the
+            # forward graph running meanwhile, so schedule on the forward queue and
+            # let stream order carry the forward-to-schedule dependencies instead.
+            # Without speculation there is no publish wait to remove, and the
+            # separate schedule stream still overlaps the next batch's preparation.
+            self.schedule_stream = self.forward_stream
+            self.future_map.same_queue_publish = True
         # The global WAR barrier fences the scheduler's next shared-buffer write
         # on the previous forward's read of the unified memory pool.
         self._war_barrier_enabled = is_cuda() or envs.SGLANG_ENABLE_WAR_BARRIER.get()
