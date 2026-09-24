@@ -657,6 +657,10 @@ class PrefillAdder:
         self.memory_budget = token_to_kv_pool_allocator.create_prefill_budget(
             tree_cache, num_mixed_decode_tokens=num_mixed_decode_tokens
         )
+        if running_batch is not None and running_batch.reqs:
+            self.memory_budget.reserve_next_decode(
+                running_batch.new_tokens_required_next_decode()
+            )
 
         self.req_states = None
         self.can_run_list = []

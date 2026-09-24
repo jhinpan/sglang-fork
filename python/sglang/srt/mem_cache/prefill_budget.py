@@ -150,6 +150,10 @@ class PrefillBudget:
         self.total_offset += immediate + max_new_tokens
         self.current_offset += immediate
 
+    def reserve_next_decode(self, num_tokens: int) -> None:
+        # total_offset already charges each running request's remaining decode.
+        pass
+
 
 class SWAPrefillBudget(PrefillBudget):
     """Separate FULL/SWA partitions, including per-request SWA rings."""
@@ -173,6 +177,12 @@ class SWAPrefillBudget(PrefillBudget):
     def remaining_swa(self):
         evictable = 0 if self.req_ring else self.tree_cache.swa_evictable_size()
         return self.allocator.swa_available_size() + evictable - self.swa_offset
+
+    def reserve_next_decode(self, num_tokens: int) -> None:
+        # Out-of-window SWA pages are freed only by decode, so a prefill that takes
+        # the next decode's pages makes it retract; a ring slot covers decode.
+        if not self.req_ring:
+            self.swa_offset += num_tokens
 
     def swa_tokens(
         self,

@@ -831,6 +831,40 @@ class TestPrefillAdder(CustomTestCase):
         req.set_extend_range.assert_not_called()
         self.assertEqual(len(adder.can_run_list), 0)
 
+    def test_hybrid_swa_prefill_leaves_running_decode_pages(self):
+        """A prefill must not take the SWA pages the running batch's next decode
+        needs; otherwise that decode retracts requests."""
+        page, window = 64, 128
+        self.mock_tree_cache.sliding_window_size = window
+        self.mock_token_allocator.full_available_size.return_value = 100_000
+        self.mock_token_allocator.create_prefill_budget.side_effect = (
+            lambda tree_cache, **kwargs: SWAPrefillBudget(
+                self.mock_token_allocator, tree_cache, **kwargs
+            )
+        )
+        request = dict(
+            extend_input_len=256,
+            total_tokens=288,
+            max_new_tokens=32,
+            input_tokens=256,
+            swa_host_hit_length=0,
+            chunk_limit=None,
+        )
+        needed = estimate_swa_kv_tokens(
+            256, 32, sliding_window_size=window, page_size=page
+        )
+        self.mock_token_allocator.swa_available_size.return_value = needed + page
+        for decode_tokens, admitted in ((0, True), (page, False), (2 * page, False)):
+            with self.subTest(decode_tokens=decode_tokens):
+                running = self.create_running_batch(
+                    [self.create_mock_req("running", priority=0, max_new_tokens=8)]
+                )
+                running.new_tokens_required_next_decode.return_value = decode_tokens
+                adder = self.create_adder(running, page_size=page)
+                self.assertEqual(
+                    adder.memory_budget.check_prefill(**request)[0], admitted
+                )
+
     def test_swa_budget_for_req(self):
         # budget = max(alloc - window, 0) + min(extend + max_new, window) + page,
         # where alloc = min(extend, rem_chunk). The decode headroom is the SWA the
