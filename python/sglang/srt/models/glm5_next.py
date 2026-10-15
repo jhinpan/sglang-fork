@@ -7,6 +7,7 @@ import torch
 from torch import nn
 from torch.nn import functional as F
 
+from sglang.experimental import monokernels as mono
 from sglang.kernels.ops.attention.fla.fused_norm_gate import FusedRMSNormGated
 from sglang.kernels.ops.layernorm.mhc import hc_contract
 from sglang.kernels.ops.layernorm.mhc import hc_post as _hc_post_fn
@@ -1176,7 +1177,13 @@ class Glm5NextModel(nn.Module):
                 normal_end_layer = normal_start_layer = 0
         aux_hidden_states = AuxHiddenStateList()
         topk_indices = None
+        plan = mono.route(self, forward_batch)
         for i in range(normal_start_layer, normal_end_layer):
+            span = mono.kernel(plan, i, "layer_in")
+            if span is not None:
+                hidden_states = span(positions, hidden_states, forward_batch)
+                topk_indices = None
+                continue
             # NOTE: torch dynamo does not support graph break in context manager
             ctx = (
                 nullcontext()
@@ -1937,6 +1944,10 @@ class Glm5NextForConditionalGeneration(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(
             self, is_nextn=is_nextn, weight_names=weight_names
         )
+
+    def precompile_kernels_after_loading(self) -> None:
+        if not self.encoder_only:
+            mono.attach(self.model, self.config)
 
     def load_kv_cache_scales(self, quantization_param_path: str) -> None:
         if self.model is None:

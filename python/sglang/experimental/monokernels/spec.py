@@ -173,6 +173,9 @@ _REGISTRY: dict[str, tuple[str, ...]] = {
     "DeepseekV4ForCausalLM": (
         "sglang.experimental.monokernels.hip.deepseek_v41.spec:SPEC",
     ),
+    "Glm5NextForConditionalGeneration": (
+        "sglang.experimental.monokernels.hip.glm53_flash.spec:SPEC",
+    ),
 }
 
 
