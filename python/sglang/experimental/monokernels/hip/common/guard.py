@@ -177,18 +177,23 @@ class Guard:
         """This rank's flags as its peers wrote them (system scope); 0 when clean."""
         if self.own is None:
             return fx.Int32(0)
-        v = fx.Vector(
-            bo.buffer_load(
+        acc = fx.Int32(0)
+        # a buffer load carries at most 4 dwords: TP 8 reads its flags in two
+        for c0 in range_constexpr(0, self.npes, 4):
+            n = min(4, self.npes - c0)
+            w = bo.buffer_load(
                 rsrc(self.own + fx.Int64(self.flags_offset)),
-                0,
-                vec_width=self.npes,
+                c0,
+                vec_width=n,
                 dtype=T.i32,
                 cache_modifier=CM_SYS,
             )
-        )
-        acc = fx.Int32(v[0])
-        for p in range_constexpr(1, self.npes):
-            acc = acc | v[p]
+            if const_expr(n == 1):
+                acc = acc | fx.Int32(w)
+            else:
+                v = fx.Vector(w)
+                for p in range_constexpr(n):
+                    acc = acc | v[p]
         return acc
 
     def stopped(self):
