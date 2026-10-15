@@ -126,10 +126,15 @@ class PeerBuffer:
         addresses = [self.local]
         if npes > 1:
             handles: list = [None] * npes
-            dist.all_gather_object(handles, _handle(self.local), group=group)
+            dist.all_gather_object(handles, (nbytes, _handle(self.local)), group=group)
             addresses, failure = [], None
             try:
-                for peer, handle in enumerate(handles):
+                for peer, (size, handle) in enumerate(handles):
+                    if size != nbytes:
+                        raise RuntimeError(
+                            f"rank {peer} offers {size} bytes, this rank {nbytes}: "
+                            "the ranks build their buffers in different orders"
+                        )
                     if peer == rank:
                         addresses.append(self.local)
                     else:
