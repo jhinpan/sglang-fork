@@ -17,7 +17,9 @@ import torch.distributed as dist
 _IPC_HANDLE_BYTES = 64
 _IPC_MEM_LAZY_ENABLE_PEER_ACCESS = 0x1
 _DEVICE_MALLOC_UNCACHED = 0x3
-_PAGE = 4096  # hipIpcGetMemHandle on uncached allocations under 2 MiB needs whole pages
+# A peer maps an IPC handle in 2 MiB granules: bytes past the last whole granule of
+# the exporter's allocation fault on the peer, so allocate whole granules.
+_PAGE = 2 << 20
 
 
 class PeerMemoryError(RuntimeError):
