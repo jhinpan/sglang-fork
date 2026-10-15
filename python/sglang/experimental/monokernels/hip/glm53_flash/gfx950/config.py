@@ -1,8 +1,10 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""GLM-5.3-Flash MonoKernel geometry (``amd/GLM-5.3-Flash-Quark-MXFP4``)."""
+# Adapted from vllm-project/vllm at ca328e297b (Apache-2.0):
+# vllm/models/glm5next/amd/ops/mono/config.py
+"""GLM-5.3-Flash monokernel geometry (``amd/GLM-5.3-Flash-Quark-MXFP4``)."""
 
-from dataclasses import dataclass
+import msgspec
 
 HIDDEN = 4096
 N_EXPERTS = 288
@@ -49,8 +51,7 @@ TP_SIZES = (2, 4, 8)
 STEP_TOKENS = (1, 2, 4, 8)
 
 
-@dataclass(frozen=True)
-class FlashShard:
+class FlashShard(msgspec.Struct, frozen=True):
     """One TP rank's share of the FFN: every routed and the shared expert hold
     1/TP of the intermediate width."""
 

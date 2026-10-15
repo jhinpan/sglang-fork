@@ -1,12 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-# Adapted from ROCm/aiter#6173 at c39b56c36 (Apache-2.0 License),
+# Adapted from vllm-project/vllm at ca328e297b (Apache-2.0):
+# vllm/models/glm5next/amd/ops/mono/ffn/layout.py, itself adapted from
+# ROCm/aiter#6173 at c39b56c36 (Apache-2.0 License),
 # Copyright (c) 2025 FlyDSL Project Contributors:
 # aiter/ops/flydsl/kernels/glm5_mono/glm/layout.py
 
-"""Compile-time storage layout and CTA schedule of the GLM-5.3-Flash FFN launch."""
+"""Compile-time storage layout and CTA schedule of the GLM-5.3-Flash layer launch."""
 
-from vllm.models.glm5next.amd.ops.mono.config import (
+from .config import (
     HC_MULT,
     HIDDEN,
     INDEX_DIM,
@@ -20,7 +22,7 @@ from vllm.models.glm5next.amd.ops.mono.config import (
     V_DIM,
     FlashShard,
 )
-from vllm.models.glm5next.amd.ops.mono.layout import (
+from .tiles import (
     BLOCKS,
     ROUTER_TILE,
     ROW_TILE,
@@ -28,30 +30,6 @@ from vllm.models.glm5next.amd.ops.mono.layout import (
     WAVES,
 )
 
-# Stages a bounded mailbox poll can expire in, one error word each.
-POLL_STAGES = (
-    "aseam",
-    "agate",
-    "inproj",
-    "fgb",
-    "kda",
-    "oproj",
-    "seam",
-    "gate",
-    "router",
-    "ug",
-    "down",
-    "qkv_a",
-    "qnorm",
-    "cache",
-    "q_b",
-    "index_q",
-    "uk",
-    "iscore",
-    "iselect",
-    "split",
-    "uv",
-)
 # rows of a projection task: one MFMA tile, or one tile a wave when K is 128
 IN_TILE = 16
 FGB_TILE = 16 * WAVES
@@ -92,17 +70,15 @@ DSA_TAB = (
     "s_o",
     "kv_cache",
     "idx_cache",
-    "tail_cache",
-    "block_table",
-    "idx_block_table",
-    "bt_stride",
-    "idx_bt_stride",
+    "tail_k",
+    "tail_g",
+    "idx_bt_group",
     "kv_block_elems",
     "kv_block_tokens",
+    "kv_row_elems",
     "idx_block_bytes",
     "idx_block_pools",
     "tail_block_elems",
-    "tail_gate_elems",
 )
 
 N_ROW_TILES = HIDDEN // ROW_TILE
@@ -152,6 +128,8 @@ def layout(
     max_pools: int = 0,
 ):
     """Byte offsets of the per-rank scratch and the symmetric peer buffer."""
+    from sglang.experimental.monokernels.hip.common.guard import FLAG_BYTES
+
     pair_bytes = 8
     shard = FlashShard(npes)
     items = []
@@ -200,9 +178,6 @@ def layout(
         ("sel", samples * MOE_SLOTS * pair_bytes),
         ("prob", samples * MOE_SLOTS * pair_bytes),
         ("mid", samples * MOE_SLOTS * inter * pair_bytes),
-        ("poll_abort", 4),
-        ("poll_err_addr", 8),
-        ("poll_xrank_addr", 8),
     ]
     assert len({name for name, _ in items}) == len(items), "mailbox names"
     offset, scratch = 0, {}
@@ -217,9 +192,9 @@ def layout(
         "attn": 0,
         "ffn": region,
         "_part_stride": part,
-        # one word per source rank, set on rank 0 by a rank whose poll expired
-        "poll_xrank": 2 * region,
-        "_bytes": 2 * region + _align(4 * npes),
+        # the guard's error flags: rank r writes word r of every rank's flags
+        "flags": 2 * region,
+        "_bytes": 2 * region + FLAG_BYTES,
     }
     return scratch, symmetric
 

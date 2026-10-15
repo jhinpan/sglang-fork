@@ -1,31 +1,79 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""One GLM-5.3-Flash MoE layer's tensors, as views of vLLM's loaded parameters
-(the router and a shared expert stored apart from the routed ones excepted: they
-are packed once into the kernel's layouts)."""
+# Adapted from vllm-project/vllm at ca328e297b (Apache-2.0):
+# vllm/models/glm5next/amd/mono/weights.py
+"""One GLM-5.3-Flash MoE layer's tensors as the launch reads them: views of
+SGLang's loaded parameters, except the copies each function names (the caller
+records them in ``copies`` so attach logs their sizes)."""
 
 from __future__ import annotations
 
-from typing import TYPE_CHECKING
+from typing import Optional
 
 import torch
 
-from vllm.models.glm5next.amd.ops.mono.config import (
+from .config import (
     HC_MULT,
     HIDDEN,
+    INDEX_DIM,
+    INDEX_HEADS,
+    KDA_DIM,
+    KPOOL,
+    KV_LORA,
     N_EXPERTS,
+    NOPE_DIM,
+    Q_LORA,
+    V_DIM,
+    FlashShard,
 )
 
-if TYPE_CHECKING:
-    from torch import nn
-
-    from vllm.models.glm5next.amd.ops.mono.ffn.op import (
-        FlashDsaWeights,
-        FlashFfnWeights,
-        FlashKdaWeights,
-    )
-
 N_MIX = HC_MULT * (2 + HC_MULT)
+
+# The SGLang names these functions read
+SGLANG_READS = {
+    "srt/models/glm5_next.py": (
+        "hc_attn_fn",
+        "hc_attn_scale",
+        "hc_attn_base",
+        "hc_ffn_fn",
+        "hc_ffn_scale",
+        "hc_ffn_base",
+        "do_fuse_qkvbfg",
+        "fused_qkvbfg_a_proj",
+        "fused_fg_b_proj",
+        "qkv_conv1d",
+        "A_log",
+        "dt_bias",
+        "o_norm",
+        "num_fused_shared_experts",
+    ),
+    "srt/models/deepseek_v2.py": (
+        "fused_qkv_a_proj_with_mqa",
+        "q_a_layernorm",
+        "kv_a_layernorm",
+        "q_b_proj",
+        "kv_b_proj",
+        "shared_experts",
+        "e_score_correction_bias",
+    ),
+    "srt/layers/attention/dsa/dsa_indexer.py": ("wk", "wq_b", "weights_proj"),
+    "srt/layers/attention/dsa/dsa_indexer_kpool.py": (
+        "index_kpool_compress_gate",
+        "index_kpool_compress_ape",
+        "k_norm",
+    ),
+    "srt/layers/quantization/fp8.py": (
+        "aiter_bpreshuffled",
+        "is_shuffled",
+        "weight_scale_inv",
+    ),
+    "srt/layers/quantization/fp8_hip.py": ("mxfp8_native_ready",),
+    "srt/layers/quantization/quark/schemes/quark_w4a4_mxfp4_moe.py": (
+        "is_shuffled",
+        "w13_weight_scale",
+        "w2_weight_scale",
+    ),
+}
 
 
 def _need(
@@ -48,74 +96,78 @@ def _bytes(name: str, t: torch.Tensor, shape: tuple) -> torch.Tensor:
     return t.view(torch.uint8)
 
 
-def experts_backend_reason(layer: nn.Module) -> str | None:
-    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import Mxfp4MoeBackend
-
-    mlp = layer.mlp
-    fused = getattr(mlp, "is_fused_shared_expert_enabled", False)
-    if not fused and getattr(mlp, "shared_experts", None) is None:
-        return "needs a shared expert"
-    routed = getattr(getattr(mlp, "experts", None), "routed_experts", None)
-    if routed is None:
-        return "needs a routed MoE"
-    backend = getattr(routed.quant_method, "mxfp4_backend", None)
-    if backend != Mxfp4MoeBackend.AITER_MXFP4_MXFP4:
-        return f"needs the AITER_MXFP4_MXFP4 MoE backend, not {backend}"
+def experts_reason(layer) -> Optional[str]:
+    """Why the layer's routed experts are not in the layout the launch reads, or None.
+    It reads AITER's A4W4 layout: (16, 16)-shuffled MXFP4 gate rows, then up rows,
+    and 3-D e8m0_shuffle scales (the GU-interleaved A16W4 layout keeps them 2-D)."""
+    experts = layer.mlp.experts
+    w13, s13 = experts.w13_weight, experts.w13_weight_scale
+    if not getattr(w13, "is_shuffled", False):
+        return "needs the MXFP4 experts in AITER's shuffled layout"
+    if s13.dim() != 3:
+        return (
+            "needs the A4W4 expert layout (gate rows, then up rows), not GU-interleaved"
+        )
     return None
 
 
-def _mxfp4_rows(name: str, linear: nn.Module, rows: int, k: int):
-    """A Quark MXFP4 linear in the AITER Triton GEMM layout (weight ``[rows, K/2]``,
-    scale stored ``[K/32, rows]``); returns the weight and a ``[rows, K/32]`` scale."""
+def _mxfp4_rows(name: str, linear, rows: int, k: int):
+    """A row-major Quark MXFP4 linear as SGLang keeps it after loading: weight
+    [rows, K / 2] and one E8M0 per 32 inputs, [rows, K / 32] (or [K / 32, rows])."""
     w, sc = linear.weight, getattr(linear, "weight_scale", None)
+    if sc is not None and tuple(sc.shape) == (k // 32, rows) and rows != k // 32:
+        sc = sc.T
     if (
         sc is None
         or w.element_size() != 1
         or sc.element_size() != 1
         or tuple(w.shape) != (rows, k // 2)
-        or tuple(sc.shape) != (k // 32, rows)
+        or tuple(sc.shape) != (rows, k // 32)
     ):
         got = None if sc is None else tuple(sc.shape)
         raise ValueError(
             f"needs shared_experts.{name} as row-major MXFP4 {(rows, k // 2)} with a "
-            f"{(k // 32, rows)} scale (VLLM_ROCM_USE_AITER_FP4_ASM_GEMM off), got "
-            f"{w.dtype} {tuple(w.shape)} and scale {got}"
+            f"{(rows, k // 32)} scale, got {w.dtype} {tuple(w.shape)} and scale {got}"
         )
-    return w.view(torch.uint8), sc.view(torch.uint8).T.contiguous()
+    return w.view(torch.uint8).contiguous(), sc.view(torch.uint8).contiguous()
 
 
-def _shared_expert(mlp: nn.Module, inter: int):
-    from vllm.models.glm5next.amd.ops.mono.packing import pack_shared_expert
+def _shared_expert(layer, idx: int, inter: int, copies: dict):
+    """The shared expert of an unfused layer (SGLang fuses it only at TP4 and TP8),
+    packed once as one expert of AITER's MoE layout."""
+    from .packing import pack_shared_expert
 
-    gate_up = _mxfp4_rows("gate_up_proj", mlp.gate_up_proj, 2 * inter, HIDDEN)
-    down = _mxfp4_rows("down_proj", mlp.down_proj, HIDDEN, inter)
-    return pack_shared_expert(*gate_up, *down)
+    shared = layer.mlp.shared_experts
+    gate_up = _mxfp4_rows("gate_up_proj", shared.gate_up_proj, 2 * inter, HIDDEN)
+    down = _mxfp4_rows("down_proj", shared.down_proj, HIDDEN, inter)
+    packed = pack_shared_expert(*gate_up, *down)
+    for name, t in zip(("w_ug", "s_ug", "w_dn", "s_dn"), packed):
+        copies["shared expert packed", idx, name] = t
+    return packed
 
 
-def layer_weights(layer: nn.Module, inter: int) -> FlashFfnWeights:
-    from vllm.models.glm5next.amd.ops.mono.ffn.op import FlashFfnWeights
-    from vllm.models.glm5next.amd.ops.mono.packing import pack_bf16
+def layer_weights(layer, idx: int, inter: int, copies: dict):
+    """The MoE side: the routed experts as stored, the router packed once, and the
+    shared expert as the fused expert slot or a packed copy."""
+    from .packing import pack_bf16
+    from .runner import FlashFfnWeights
 
-    why = experts_backend_reason(layer)
+    why = experts_reason(layer)
     if why is not None:
         raise ValueError(why)
-    mlp = layer.mlp
-    routed = mlp.experts.routed_experts
-    fused = mlp.is_fused_shared_expert_enabled
+    mlp, experts = layer.mlp, layer.mlp.experts
+    fused = mlp.num_fused_shared_experts > 0
     E = N_EXPERTS + 1 if fused else N_EXPERTS
-    w_ug = _bytes("w13_weight", routed.w13_weight, (E, 2 * inter, HIDDEN // 2))
+    w_ug = _bytes("w13_weight", experts.w13_weight, (E, 2 * inter, HIDDEN // 2))
     s_ug = _bytes(
-        "w13_weight_scale", routed.w13_weight_scale, (E, 2 * inter, HIDDEN // 32)
+        "w13_weight_scale", experts.w13_weight_scale, (E, 2 * inter, HIDDEN // 32)
     )
-    w_dn = _bytes("w2_weight", routed.w2_weight, (E, HIDDEN, inter // 2))
-    s_dn = _bytes("w2_weight_scale", routed.w2_weight_scale, (E, HIDDEN, inter // 32))
-    for name, t in (("w13_weight", routed.w13_weight), ("w2_weight", routed.w2_weight)):
-        if not getattr(t, "is_shuffled", False):
-            raise ValueError(f"needs {name} in AITER's shuffled layout")
+    w_dn = _bytes("w2_weight", experts.w2_weight, (E, HIDDEN, inter // 2))
+    s_dn = _bytes("w2_weight_scale", experts.w2_weight_scale, (E, HIDDEN, inter // 32))
     if fused:
         shared = (w_ug[N_EXPERTS], s_ug[N_EXPERTS], w_dn[N_EXPERTS], s_dn[N_EXPERTS])
     else:
-        shared = _shared_expert(mlp.shared_experts, inter)
+        shared = _shared_expert(layer, idx, inter, copies)
     gate = _need(
         "gate.weight",
         mlp.gate.weight,
@@ -125,14 +177,19 @@ def layer_weights(layer: nn.Module, inter: int) -> FlashFfnWeights:
     router = gate.to(torch.bfloat16)
     if gate.dtype != torch.bfloat16 and not torch.equal(router.float(), gate):
         raise ValueError("needs router weights exactly representable in bf16")
+    w_r = pack_bf16(router)
+    copies["router packed", idx] = w_r
     bias = _need(
         "gate.e_score_correction_bias",
         mlp.gate.e_score_correction_bias,
         (N_EXPERTS,),
-        (torch.float32,),
+        (torch.float32, torch.bfloat16),
     )
+    if bias.dtype != torch.float32:
+        bias = bias.float()
+        copies["f32 router bias", idx] = bias
     return FlashFfnWeights(
-        w_r=pack_bf16(router),
+        w_r=w_r,
         bias=bias,
         w_ug=w_ug,
         s_ug=s_ug,
@@ -156,15 +213,16 @@ def layer_weights(layer: nn.Module, inter: int) -> FlashFfnWeights:
     )
 
 
-def _proj(name: str, linear: nn.Module, rows: int, cols: int):
-    """A row-major projection as vLLM keeps it after loading: FP8 E4M3 with f32
-    128 x 128 block scales, or bf16 (scale None)."""
+def _proj(name: str, linear, rows: int, cols: int):
+    """A projection as SGLang keeps it after loading: (weight, scales, shuffled).
+    FP8 E4M3 with f32 128 x 128 block scales, row-major or AITER-shuffled in place,
+    or row-major bf16 (scales None)."""
     w = linear.weight
+    if w.dtype == torch.bfloat16:
+        return _need(f"{name}.weight", w, (rows, cols), (torch.bfloat16,)), None, False
+    if getattr(linear, "mxfp8_native_ready", False):
+        raise ValueError(f"needs {name} as block FP8; it was requantized to MXFP8")
     sc = getattr(linear, "weight_scale_inv", None)
-    if sc is None:
-        sc = getattr(linear, "weight_scale", None)
-    if w.dtype == torch.bfloat16 and tuple(w.shape) == (rows, cols):
-        return _need(f"{name}.weight", w, (rows, cols), (torch.bfloat16,)), None
     if (
         w.dtype != torch.float8_e4m3fn
         or tuple(w.shape) != (rows, cols)
@@ -178,38 +236,48 @@ def _proj(name: str, linear: nn.Module, rows: int, cols: int):
         raise ValueError(
             f"needs {name} as row-major bf16 {(rows, cols)}, or FP8 E4M3 with f32 "
             f"{(rows // 128, cols // 128)} block scales; got {w.dtype} "
-            f"{tuple(w.shape)} and scale {got}"
+            f"{tuple(w.shape)} {tuple(w.stride())} and scale {got}"
         )
-    return w, sc
-
-
-def dsa_weights(layer: nn.Module, tp: int) -> FlashDsaWeights:
-    """A sparse-attention layer's attention side as views of vLLM's parameters;
-    W_UK^T is packed once from kv_b_proj into [H, 512, 256] bf16."""
-    from vllm.models.glm5next.amd.ops.mono.config import (
-        INDEX_DIM,
-        INDEX_HEADS,
-        KPOOL,
-        KV_LORA,
-        NOPE_DIM,
-        Q_LORA,
-        V_DIM,
-        FlashShard,
+    shuffled = getattr(linear, "aiter_bpreshuffled", False) or getattr(
+        w, "is_shuffled", False
     )
-    from vllm.models.glm5next.amd.ops.mono.ffn.op import FlashDsaWeights
+    return w, sc, bool(shuffled)
+
+
+def dsa_weights(layer, idx: int, tp: int, copies: dict):
+    """A sparse-attention layer's attention side: views of SGLang's parameters, plus
+    W_UK^T packed once from kv_b_proj into [H, 512, 256] bf16 and the indexer's
+    wk | weights_proj in one bf16 matrix."""
+    from .runner import FlashDsaWeights
 
     attn = layer.self_attn
-    idx = attn.indexer
-    H = FlashShard(tp).mla_heads
+    idx_mod = attn.indexer
+    H = FlashShard(tp=tp).mla_heads
     bf16, f32 = (torch.bfloat16,), (torch.float32,)
-    w_qkv, s_qkv = _proj(
-        "fused_qkv_a_proj", attn.fused_qkv_a_proj, Q_LORA + KV_LORA, HIDDEN
+    w_qkv, s_qkv, qkv_sh = _proj(
+        "fused_qkv_a_proj_with_mqa",
+        attn.fused_qkv_a_proj_with_mqa,
+        Q_LORA + KV_LORA,
+        HIDDEN,
     )
-    w_qb, s_qb = _proj("q_b_proj", attn.q_b_proj, H * NOPE_DIM, Q_LORA)
-    w_o, s_o = _proj("o_proj", attn.o_proj, HIDDEN, H * V_DIM)
+    w_qb, s_qb, qb_sh = _proj("q_b_proj", attn.q_b_proj, H * NOPE_DIM, Q_LORA)
+    w_o, s_o, o_sh = _proj("o_proj", attn.o_proj, HIDDEN, H * V_DIM)
     per = NOPE_DIM + V_DIM
     kv_b = _need("kv_b_proj.weight", attn.kv_b_proj.weight, (H * per, KV_LORA), bf16)
     w_uk = kv_b.view(H, per, KV_LORA)[:, :NOPE_DIM].transpose(1, 2).contiguous()
+    copies["W_UK^T bf16", idx] = w_uk
+    wk = _need("indexer.wk.weight", idx_mod.wk.weight, (INDEX_DIM, HIDDEN), bf16)
+    wp = _need(
+        "indexer.weights_proj.weight",
+        idx_mod.weights_proj.weight,
+        (INDEX_HEADS, HIDDEN),
+        (torch.bfloat16, torch.float32),
+    )
+    wp16 = wp.to(torch.bfloat16)
+    if wp.dtype != torch.bfloat16 and not torch.equal(wp16.float(), wp):
+        raise ValueError("needs indexer weights_proj exactly representable in bf16")
+    w_idx = torch.cat([wk, wp16]).contiguous()
+    copies["indexer wk | weights_proj bf16", idx] = w_idx
     return FlashDsaWeights(
         hc_fn=_need("hc_attn_fn", layer.hc_attn_fn, (N_MIX, HC_MULT * HIDDEN), f32),
         hc_scale=_need("hc_attn_scale", layer.hc_attn_scale, (3,), f32),
@@ -219,15 +287,10 @@ def dsa_weights(layer: nn.Module, tp: int) -> FlashDsaWeights:
         ),
         w_qkv=w_qkv,
         s_qkv=s_qkv,
-        w_idx=_need(
-            "indexer.wk_weights_proj.weight",
-            idx.wk_weights_proj.weight,
-            (INDEX_DIM + INDEX_HEADS, HIDDEN),
-            bf16,
-        ),
+        w_idx=w_idx,
         w_gate=_need(
             "indexer.index_kpool_compress_gate",
-            idx.index_kpool_compress_gate,
+            idx_mod.index_kpool_compress_gate,
             (INDEX_DIM, HIDDEN),
             bf16,
         ),
@@ -235,11 +298,11 @@ def dsa_weights(layer: nn.Module, tp: int) -> FlashDsaWeights:
         g_kv=_need(
             "kv_a_layernorm.weight", attn.kv_a_layernorm.weight, (KV_LORA,), bf16
         ),
-        ln_w=_need("indexer.k_norm.weight", idx.k_norm.weight, (INDEX_DIM,), f32),
-        ln_b=_need("indexer.k_norm.bias", idx.k_norm.bias, (INDEX_DIM,), f32),
+        ln_w=_need("indexer.k_norm.weight", idx_mod.k_norm.weight, (INDEX_DIM,), f32),
+        ln_b=_need("indexer.k_norm.bias", idx_mod.k_norm.bias, (INDEX_DIM,), f32),
         ape=_need(
             "indexer.index_kpool_compress_ape",
-            idx.index_kpool_compress_ape,
+            idx_mod.index_kpool_compress_ape,
             (KPOOL, INDEX_DIM),
             f32,
         ),
@@ -247,7 +310,7 @@ def dsa_weights(layer: nn.Module, tp: int) -> FlashDsaWeights:
         s_qb=s_qb,
         w_iq=_need(
             "indexer.wq_b.weight",
-            idx.wq_b.weight,
+            idx_mod.wq_b.weight,
             (INDEX_HEADS * INDEX_DIM, Q_LORA),
             bf16,
         ),
@@ -255,32 +318,31 @@ def dsa_weights(layer: nn.Module, tp: int) -> FlashDsaWeights:
         w_kvb=kv_b,
         w_o=w_o,
         s_o=s_o,
+        shuffled=(qkv_sh, qb_sh, o_sh),
     )
 
 
-def kda_weights(layer: nn.Module, tp: int) -> FlashKdaWeights:
-    """A KDA layer's attention side, as views of vLLM's row-major bf16 projections;
-    the q | k | v conv taps are packed once into one [3P, 4] tensor."""
-    from vllm.models.glm5next.amd.ops.mono.config import KDA_DIM, FlashShard
-    from vllm.models.glm5next.amd.ops.mono.ffn.op import FlashKdaWeights
+def kda_weights(layer, idx: int, tp: int, copies: dict):
+    """A KDA layer's attention side: views of SGLang's fused bf16 projections; the
+    o_norm weight as f32 (a copy when SGLang keeps it in bf16)."""
+    from .runner import FlashKdaWeights
 
     attn = layer.self_attn
-    shard = FlashShard(tp)
+    shard = FlashShard(tp=tp)
     P, H, D = shard.kda_proj, shard.kda_heads, KDA_DIM
     bf16, f32 = (torch.bfloat16,), (torch.float32,)
-
-    def linear(name, rows, cols):
-        return _need(f"{name}.weight", getattr(attn, name).weight, (rows, cols), bf16)
-
-    taps = []
-    for name in ("q_conv1d", "k_conv1d", "v_conv1d"):
-        conv = getattr(attn, name)
-        if conv.bias is not None:
-            raise ValueError(f"needs {name} without bias")
-        taps.append(_need(f"{name}.weight", conv.weight, (P, 1, 4), f32).view(P, 4))
+    if not attn.do_fuse_qkvbfg:
+        raise ValueError("needs the fused q | k | v | beta | f_a | g_a projection")
+    fg_b = _need("fused_fg_b_proj.weight", attn.fused_fg_b_proj.weight, (2, P, D), bf16)
+    conv = _need("qkv_conv1d.weight", attn.qkv_conv1d.weight, (3 * P, 1, 4), f32)
+    if attn.qkv_conv1d.bias is not None:
+        raise ValueError("needs the short conv without bias")
     w_on = attn.o_norm.weight
     if w_on is None or tuple(w_on.shape) != (D,):
         raise ValueError("needs o_norm with a weight")
+    if w_on.dtype != torch.float32:
+        w_on = w_on.float().contiguous()
+        copies["o_norm f32", idx] = w_on
     return FlashKdaWeights(
         hc_fn=_need("hc_attn_fn", layer.hc_attn_fn, (N_MIX, HC_MULT * HIDDEN), f32),
         hc_scale=_need("hc_attn_scale", layer.hc_attn_scale, (3,), f32),
@@ -288,12 +350,17 @@ def kda_weights(layer: nn.Module, tp: int) -> FlashKdaWeights:
         g_norm=_need(
             "input_layernorm.weight", layer.input_layernorm.weight, (HIDDEN,), bf16
         ),
-        w_in=linear("in_proj_qkvbfg_a", shard.kda_in_rows, HIDDEN),
-        w_fb=linear("f_b_proj", P, D),
-        w_gb=linear("g_b_proj", P, D),
-        conv_w=torch.cat(taps).contiguous(),
+        w_in=_need(
+            "fused_qkvbfg_a_proj.weight",
+            attn.fused_qkvbfg_a_proj.weight,
+            (shard.kda_in_rows, HIDDEN),
+            bf16,
+        ),
+        w_fb=fg_b[0],
+        w_gb=fg_b[1],
+        conv_w=conv.view(3 * P, 4),
         a_log=_need("A_log", attn.A_log, (1, 1, H, 1), f32).view(H),
         dt_bias=_need("dt_bias", attn.dt_bias, (P,), f32),
-        w_on=w_on.float().contiguous(),
-        w_o=linear("o_proj", HIDDEN, P),
+        w_on=w_on,
+        w_o=_need("o_proj.weight", attn.o_proj.weight, (HIDDEN, P), bf16),
     )
